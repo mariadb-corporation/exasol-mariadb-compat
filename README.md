@@ -20,12 +20,7 @@ This file is regenerated every PR and contains all the UDFs and main preprocesso
 
 ### 2) Import the SQL file into Exasol
 
-Option A) Via Exaplus
-```sh
-exaplus -c <host>:8563 -u sys -p <pw> -f mariadb-compat.sql
-```
-
-Option B) Via Python(pyexasol)
+Option A) Via Python (pyexasol) — **recommended**, installs all 9 scripts
 ```sh
 git clone https://github.com/mariadb-AllenHerrera/exasol-mariadb-compat.git
 cd exasol-mariadb-compat
@@ -33,6 +28,19 @@ cd exasol-mariadb-compat
 pip install pyexasol
 python install.py --host <host> --user sys --password <pw> [--no-ssl-verify]
 ```
+
+Option B) Via Exaplus — installs 8 of 9 (production preprocessor included)
+```sh
+exaplus -c <host>:8563 -u sys -p <pw> -f mariadb-compat.sql
+```
+
+Exaplus 25.2.6 has a client-side parser bug that prevents two
+`--/ ... /` `PREPROCESSOR` blocks installing in the same file: after
+the first one, subsequent `--/` markers no longer enter script-body mode
+and the next script's body is silently dropped. The bundle orders
+`UTIL.MARIA_PREPROCESSOR` (production) before
+`UTIL.MARIA_PREPROCESSOR_DEBUG` (dev-only) so production survives via
+exaplus. Use `python install.py` if you also need DEBUG.
 
 Re-run either command any time to pick up new/updated UDFs.
 
