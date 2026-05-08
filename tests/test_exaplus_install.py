@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Smoke test: install dist/mariadb-compat.sql via `exaplus -f` against a
-running Exasol container, then verify the expected 8 of 9 UTIL.* scripts
-landed. Pins the exaplus path to its known-good behavior so we'd catch a
-regression that drops a SCALAR UDF or the production MARIA_PREPROCESSOR.
+running Exasol container, then verify all 9 UTIL.* scripts land AND each
+has a non-truncated body. The body-length check is what catches the
+exaplus 25.2.6 PREPROCESSOR-script bug: the script name appears in
+EXA_ALL_SCRIPTS but the body stops at the first `;` (or unbalanced `'`)
+in a Python comment, so existence-only checks pass while the rewrites
+silently no-op.
 
-Why 8, not 9: exaplus 25.2.6 has a client-side parser bug — after the
-first `--/ ... /` PREPROCESSOR block, subsequent `--/` markers no longer
-enter script-body mode and the next script's body is silently dropped.
-The bundle orders MARIA_PREPROCESSOR (production) before
-MARIA_PREPROCESSOR_DEBUG (dev-only) so production survives. Users who
-need DEBUG run install.py instead.
+Build.sh sanitizes preprocessor bodies for the bundle (strips comment-only
+lines, omits --/ markers, terminates with bare `;`), so the bundled body
+is shorter than the source — we compare each installed script against the
+*bundled* body length, not the original source.
 
 Requires: pyexasol, plus a Docker-running Exasol container that ships
 exaplus inside it (default name: exasoldb). Skips with a clear message
@@ -27,7 +28,8 @@ from pathlib import Path
 EXAPLUS_PATH = "/opt/exasol/db-2025.2.1/bin/Console/exaplus"
 EXPECTED_VIA_EXAPLUS = {
     "JSON_EXTRACT", "JSON_MERGE_PRESERVE", "JSON_OBJECT", "JSON_UNQUOTE",
-    "GET_GLOT_VERSION", "ELT", "FIELD", "MARIA_PREPROCESSOR",
+    "GET_GLOT_VERSION", "ELT", "FIELD",
+    "MARIA_PREPROCESSOR", "MARIA_PREPROCESSOR_DEBUG",
 }
 
 
@@ -99,11 +101,10 @@ def main() -> int:
         print(f"[fail] exaplus exit {run.returncode}: {run.stderr.strip()}", file=sys.stderr)
         return 1
 
-    rows = c.execute("SELECT script_name FROM EXA_ALL_SCRIPTS "
+    rows = c.execute("SELECT script_name, LENGTH(script_text) FROM EXA_ALL_SCRIPTS "
                      "WHERE script_schema='UTIL' ORDER BY script_name").fetchall()
-    installed = {r[0] for r in rows}
-    missing = EXPECTED_VIA_EXAPLUS - installed
-    extra = installed - EXPECTED_VIA_EXAPLUS - {"MARIA_PREPROCESSOR_DEBUG"}
+    installed = {r[0]: r[1] for r in rows}
+    missing = EXPECTED_VIA_EXAPLUS - installed.keys()
 
     if missing:
         print(f"[fail] exaplus install missing scripts: {sorted(missing)}", file=sys.stderr)
@@ -111,12 +112,54 @@ def main() -> int:
         print("---- exaplus stdout ----", file=sys.stderr)
         print(run.stdout, file=sys.stderr)
         return 1
-    if extra:
-        print(f"[warn] unexpected extra scripts in UTIL: {sorted(extra)}", file=sys.stderr)
 
-    print(f"[ok] exaplus -f installed all {len(EXPECTED_VIA_EXAPLUS)} expected scripts: "
-          f"{sorted(EXPECTED_VIA_EXAPLUS)}")
+    # Body-length check: the catalog SCRIPT_TEXT must be at least as long as
+    # the script's section in the bundle (minus the SQL comment header and
+    # block delimiters). If a body got truncated at a `;`/`'` in a Python
+    # comment, this catches it.
+    bundle = args.bundle.read_text()
+    expected_lengths = _bundled_body_lengths(bundle)
+    truncated = []
+    for name in sorted(EXPECTED_VIA_EXAPLUS):
+        want = expected_lengths.get(name, 0)
+        got = installed[name]
+        # Allow modest formatting differences (Exasol normalizes whitespace
+        # in CREATE-statement headers); flag anything below 80% of expected.
+        if want and got < want * 0.8:
+            truncated.append((name, got, want))
+    if truncated:
+        print("[fail] exaplus install produced truncated bodies:", file=sys.stderr)
+        for name, got, want in truncated:
+            print(f"  {name}: catalog={got}B, bundle expected ~{want}B", file=sys.stderr)
+        return 1
+
+    print(f"[ok] exaplus -f installed all {len(EXPECTED_VIA_EXAPLUS)} expected scripts "
+          f"with full bodies: {sorted(EXPECTED_VIA_EXAPLUS)}")
     return 0
+
+
+def _bundled_body_lengths(bundle: str) -> dict[str, int]:
+    """Map script name → length of its CREATE statement in the bundle, so we
+    can compare against catalog SCRIPT_TEXT and catch silent truncation."""
+    import re
+    out = {}
+    # Bundle sections look like:
+    #   -- === <relpath> ===
+    #   [--/]
+    #   CREATE [OR REPLACE] ... SCRIPT [UTIL.]<NAME>...
+    #   <body>
+    #   [/ or ;]
+    sections = re.split(r"^-- === [^\n]+ ===\n", bundle, flags=re.M)
+    for section in sections[1:]:
+        m = re.search(r"CREATE\s+(?:OR\s+REPLACE\s+)?[A-Z0-9 ]+SCRIPT\s+(?:UTIL\.)?(\w+)",
+                      section, re.I)
+        if not m:
+            continue
+        # Strip leading `--/` and trailing `/` or `;` block-marker lines
+        body = re.sub(r"^--/\n", "", section)
+        body = re.sub(r"\n[/;]\s*\n.*$", "", body, flags=re.S)
+        out[m.group(1).upper()] = len(body)
+    return out
 
 
 if __name__ == "__main__":

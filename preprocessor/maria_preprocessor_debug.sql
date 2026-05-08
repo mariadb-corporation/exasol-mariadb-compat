@@ -5,13 +5,13 @@ CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT UTIL.MARIA_PREPROCESSOR_DEBUG AS
 # development to surface sqlglot ParseErrors and transform bugs as immediate
 # query failures with full tracebacks.
 #
-# Toggle:
-#   ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR_DEBUG;
+# Toggle on with:
+#   ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR_DEBUG
 #
-# Switch back for production:
-#   ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR;
+# Switch back for production with:
+#   ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR
 #
-# The rewrite logic below MUST stay byte-identical to the safe variant; only
+# The rewrite logic below MUST stay byte-identical to the safe variant — only
 # adapter_call differs. If you change rules in one, change them in the other.
 
 import json
@@ -66,7 +66,7 @@ def _rewrite_to_util(node):
 
     if isinstance(node, exp.CTE):
         # Exasol requires every CTE projection to have a name (alias or column
-        # reference); MariaDB happily accepts bare literals/expressions and
+        # reference) — MariaDB happily accepts bare literals/expressions and
         # synthesizes a display name. For each projection inside the CTE body
         # — including each branch of a UNION/INTERSECT/EXCEPT chain — that has
         # no implicit name, inject AS _col<i>. An explicit outer column list

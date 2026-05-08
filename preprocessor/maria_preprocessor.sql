@@ -10,10 +10,10 @@ CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT UTIL.MARIA_PREPROCESSOR AS
 # preprocessor-level crash, and Exasol-only syntax (OPEN SCHEMA, MINUS, etc.)
 # sails through.
 #
-# For loud-failure dev iteration, swap to UTIL.MARIA_PREPROCESSOR_DEBUG:
-#   ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR_DEBUG;
+# For loud-failure dev iteration, swap to UTIL.MARIA_PREPROCESSOR_DEBUG with
+#   ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR_DEBUG
 #
-# Rewrites below must stay byte-identical to the debug variant; only
+# Rewrites below must stay byte-identical to the debug variant — only
 # adapter_call differs. Keep them in sync.
 
 import json
@@ -71,7 +71,7 @@ def _rewrite_to_util(node):
 
     if isinstance(node, exp.CTE):
         # Exasol requires every CTE projection to have a name (alias or column
-        # reference); MariaDB happily accepts bare literals/expressions and
+        # reference) — MariaDB happily accepts bare literals/expressions and
         # synthesizes a display name. For each projection inside the CTE body
         # — including each branch of a UNION/INTERSECT/EXCEPT chain — that has
         # no implicit name, inject AS _col<i>. An explicit outer column list

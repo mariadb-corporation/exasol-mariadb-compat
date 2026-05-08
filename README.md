@@ -29,18 +29,19 @@ pip install pyexasol
 python install.py --host <host> --user sys --password <pw> [--no-ssl-verify]
 ```
 
-Option B) Via Exaplus — installs 8 of 9 (production preprocessor included)
+Option B) Via Exaplus
 ```sh
 exaplus -c <host>:8563 -u sys -p <pw> -f mariadb-compat.sql
 ```
 
-Exaplus 25.2.6 has a client-side parser bug that prevents two
-`--/ ... /` `PREPROCESSOR` blocks installing in the same file: after
-the first one, subsequent `--/` markers no longer enter script-body mode
-and the next script's body is silently dropped. The bundle orders
-`UTIL.MARIA_PREPROCESSOR` (production) before
-`UTIL.MARIA_PREPROCESSOR_DEBUG` (dev-only) so production survives via
-exaplus. Use `python install.py` if you also need DEBUG.
+Exaplus 25.2.6 does not enter script-body mode for
+`CREATE … PREPROCESSOR SCRIPT` (it works fine for `SCALAR SCRIPT`), so
+the body is parsed as SQL and any `;` or unbalanced `'` in a Python
+comment terminates the statement early. `build.sh` works around this
+by stripping comment-only lines from preprocessor bodies in the bundle
+and terminating each preprocessor with a bare `;`. Source files keep
+their human-readable comments, so `install.py` still ships the full
+documented body to the catalog.
 
 Re-run either command any time to pick up new/updated UDFs.
 
