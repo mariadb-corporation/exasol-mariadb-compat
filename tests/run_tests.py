@@ -123,18 +123,21 @@ class _SubprocessRunner:
 
 def _reload_udfs_and_preprocessor(c, repo_root: Path, verbose: int = 0) -> int:
     """Run dist/mariadb-compat.sql against the open connection so the test
-    session always exercises the working-tree bundle. The bundle uses both
-    `^/$` (block-end / statement separator) and `^--/$` (block-start marker
-    for script bodies); split on either. Each resulting part is a single
-    statement with optional surrounding SQL comments — strip leading `--`
-    and blank lines, then send what remains to Exasol. Returns the count of
-    statements actually executed."""
+    session always exercises the working-tree bundle. The bundle separates
+    statements three ways: SCALAR scripts are wrapped in `^--/$` ... `^/$`
+    block markers (so exaplus enters script-body mode), and PREPROCESSOR
+    scripts terminate with a bare `^;$` line (build.sh notes that exaplus
+    25.2.6 doesn't enter script-body mode for CREATE PREPROCESSOR SCRIPT).
+    Split on any of the three so each CREATE statement becomes one execute()
+    call. Each resulting part is a single statement with optional surrounding
+    SQL comments — strip leading `--` and blank lines, then send what remains
+    to Exasol. Returns the count of statements actually executed."""
     bundle = repo_root / "dist" / "mariadb-compat.sql"
     if not bundle.exists():
         raise FileNotFoundError(
             f"{bundle} not found — run ./build.sh to regenerate, or pass --no-reload"
         )
-    parts = re.split(r"(?m)^\s*(?:--/|/)\s*$", bundle.read_text())
+    parts = re.split(r"(?m)^\s*(?:--/|/|;)\s*$", bundle.read_text())
     executed = 0
     for part in parts:
         body = []
