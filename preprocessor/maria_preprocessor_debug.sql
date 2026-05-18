@@ -16,7 +16,7 @@ CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT UTIL.MARIA_PREPROCESSOR_DEBUG AS
 
 import json
 import sqlglot
-from sqlglot import exp
+from sqlglot import expressions as exp
 
 
 def adapter_call(request):

@@ -1,24 +1,8 @@
 CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT UTIL.MARIA_PREPROCESSOR AS
 
-# Transparent MariaDB -> Exasol query rewriter (production / "safe" variant).
-#
-# sqlglot (inside the current SLC) parses the incoming MariaDB SQL into an
-# AST. We walk it and rewrite specific constructs into UTIL.* calls (or into
-# native Exasol functions) that preserve MariaDB semantics. Any failure in
-# parse/transform/generate returns the original statement unchanged so Exasol
-# gets a chance to execute it natively — better a database-level error than a
-# preprocessor-level crash, and Exasol-only syntax (OPEN SCHEMA, MINUS, etc.)
-# sails through.
-#
-# For loud-failure dev iteration, swap to UTIL.MARIA_PREPROCESSOR_DEBUG with
-#   ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR_DEBUG
-#
-# Rewrites below must stay byte-identical to the debug variant — only
-# adapter_call differs. Keep them in sync.
-
 import json
 import sqlglot
-from sqlglot import exp
+from sqlglot import expressions as exp
 
 
 def adapter_call(request):
@@ -41,24 +25,9 @@ def _rewrite_to_util(node):
             and node.table == ""
             and node.name
             and node.name.upper() in _EXASOL_BARE_KEYWORDS):
-        # sqlglot parses bare `CURRENT_SESSION` / `CURRENT_STATEMENT` /
-        # `CURRENT_SCHEMA` as generic Columns (no typed node like
-        # exp.CurrentUser / exp.CurrentDate), so the Exasol generator quotes
-        # them as identifiers — `SELECT "CURRENT_SESSION"` — and Exasol then
-        # can't resolve the pseudo-column. MaxScale's mariadb_smartrouter
-        # emits `SELECT CURRENT_SESSION` as a backend probe, so an unfixed
-        # preprocessor breaks every connector through MaxScale + ExasolRouter.
-        # exp.Var emits the bare unquoted name.
         return exp.Var(this=node.name)
 
     if isinstance(node, exp.Set):
-        # MariaDB connectors emit `SET NAMES <charset> [COLLATE <c>]` as a
-        # connection-init handshake (client/server text encoding negotiation).
-        # Exasol has no equivalent — it stores everything as UTF-8 internally,
-        # and rejects standalone `SET <var>` / `SET ENCODING` via the WebSocket
-        # protocol with "syntax error, unexpected IDENTIFIER_PART_". Rewrite
-        # to a comment-only statement (Exasol parses comments as no-ops with
-        # result_type=rowCount), so the handshake silently succeeds.
         items = node.expressions or []
         if (len(items) == 1
                 and isinstance(items[0], exp.SetItem)
@@ -70,13 +39,6 @@ def _rewrite_to_util(node):
             )
 
     if isinstance(node, exp.CTE):
-        # Exasol requires every CTE projection to have a name (alias or column
-        # reference) — MariaDB happily accepts bare literals/expressions and
-        # synthesizes a display name. For each projection inside the CTE body
-        # — including each branch of a UNION/INTERSECT/EXCEPT chain — that has
-        # no implicit name, inject AS _col<i>. An explicit outer column list
-        # (WITH t(a,b) AS ...) still wins, so this is at worst verbose, never
-        # wrong.
         inner = node.this
         if isinstance(inner, exp.Select):
             _alias_unaliased_select(inner)
@@ -105,9 +67,6 @@ def _rewrite_to_util(node):
     if (isinstance(node, exp.Anonymous)
             and isinstance(node.this, str)
             and node.this.upper() == "JSON_UNQUOTE"):
-        # sqlglot.transform does not recurse into a replaced node's children,
-        # so apply _rewrite to inner args here — otherwise JSON_UNQUOTE(JSON_EXTRACT(...))
-        # would leave the inner JSON_EXTRACT untransformed and unresolvable on Exasol.
         new_exprs = [e.transform(_rewrite_to_util) if isinstance(e, exp.Expression) else e
                      for e in node.expressions]
         return exp.Anonymous(this="UTIL.JSON_UNQUOTE", expressions=new_exprs)
@@ -115,9 +74,6 @@ def _rewrite_to_util(node):
     if (isinstance(node, exp.Anonymous)
             and isinstance(node.this, str)
             and node.this.upper() in ("JSON_MERGE_PRESERVE", "JSON_MERGE")):
-        # JSON_MERGE is the deprecated MariaDB alias of JSON_MERGE_PRESERVE.
-        # Same recursion concern as JSON_UNQUOTE above — descend into args
-        # so e.g. JSON_MERGE_PRESERVE(JSON_EXTRACT(doc, '$.a'), ...) still rewrites.
         new_exprs = [e.transform(_rewrite_to_util) if isinstance(e, exp.Expression) else e
                      for e in node.expressions]
         return exp.Anonymous(this="UTIL.JSON_MERGE_PRESERVE", expressions=new_exprs)
@@ -125,14 +81,10 @@ def _rewrite_to_util(node):
     if (isinstance(node, exp.Anonymous)
             and isinstance(node.this, str)
             and node.this.upper() == "ELT"):
-        # The SLC's bundled sqlglot (currently 27.6.0) parses ELT as Anonymous —
-        # this branch is what fires today. Same recursion rule as JSON_UNQUOTE.
         new_exprs = [e.transform(_rewrite_to_util) if isinstance(e, exp.Expression) else e
                      for e in node.expressions]
         return exp.Anonymous(this="UTIL.ELT", expressions=new_exprs)
 
-    # Newer sqlglot exposes a typed exp.Elt node (this=N, expressions=[strs...]).
-    # Guarded with getattr so the preprocessor doesn't crash on the older SLC.
     _Elt = getattr(exp, "Elt", None)
     if _Elt is not None and isinstance(node, _Elt):
         args = [node.this, *node.expressions]
@@ -143,9 +95,6 @@ def _rewrite_to_util(node):
     if (isinstance(node, exp.Anonymous)
             and isinstance(node.this, str)
             and node.this.upper() == "FIELD"):
-        # FIELD is the complement of ELT: index of `str` in the trailing list.
-        # sqlglot has no typed node for it (in 27.x or 30.x), so Anonymous is
-        # the only shape we need to handle. Same recursion rule as JSON_UNQUOTE.
         new_exprs = [e.transform(_rewrite_to_util) if isinstance(e, exp.Expression) else e
                      for e in node.expressions]
         return exp.Anonymous(this="UTIL.FIELD", expressions=new_exprs)
