@@ -73,6 +73,13 @@ def _rewrite_to_util(node):
 
     if (isinstance(node, exp.Anonymous)
             and isinstance(node.this, str)
+            and node.this.upper() == "JSON_QUOTE"):
+        new_exprs = [e.transform(_rewrite_to_util) if isinstance(e, exp.Expression) else e
+                     for e in node.expressions]
+        return exp.Anonymous(this="UTIL.JSON_QUOTE", expressions=new_exprs)
+
+    if (isinstance(node, exp.Anonymous)
+            and isinstance(node.this, str)
             and node.this.upper() in ("JSON_MERGE_PRESERVE", "JSON_MERGE")):
         new_exprs = [e.transform(_rewrite_to_util) if isinstance(e, exp.Expression) else e
                      for e in node.expressions]

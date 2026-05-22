@@ -1,0 +1,1 @@
+SELECT JSON_UNQUOTE(JSON_QUOTE('hello world'))
