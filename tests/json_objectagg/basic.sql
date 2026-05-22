@@ -1,0 +1,1 @@
+SELECT JSON_OBJECTAGG(`KEYNAME`, `VAL`) FROM `objectagg_test`

@@ -72,6 +72,27 @@ def _rewrite_to_util(node):
 
     if (isinstance(node, exp.Anonymous)
             and isinstance(node.this, str)
+            and node.this.upper() == "JSON_OBJECTAGG"):
+        new_exprs = [e.transform(_rewrite_to_util) if isinstance(e, exp.Expression) else e
+                     for e in node.expressions]
+        return _wrap_json_objectagg(new_exprs)
+
+    _JSONObjectAgg = getattr(exp, "JSONObjectAgg", None)
+    if _JSONObjectAgg is not None and isinstance(node, _JSONObjectAgg):
+        args = []
+        for kv in node.expressions:
+            k = kv.this
+            v = kv.expression
+            if isinstance(k, exp.Expression):
+                k = k.transform(_rewrite_to_util)
+            if isinstance(v, exp.Expression):
+                v = v.transform(_rewrite_to_util)
+            args.append(k)
+            args.append(v)
+        return _wrap_json_objectagg(args)
+
+    if (isinstance(node, exp.Anonymous)
+            and isinstance(node.this, str)
             and node.this.upper() == "JSON_UNQUOTE"):
         new_exprs = [e.transform(_rewrite_to_util) if isinstance(e, exp.Expression) else e
                      for e in node.expressions]
@@ -113,6 +134,24 @@ def _rewrite_to_util(node):
         return exp.Anonymous(this="UTIL.FIELD", expressions=new_exprs)
 
     return node
+
+
+def _wrap_json_objectagg(args):
+    # Build UTIL.JSON_OBJECTAGG(LISTAGG(UTIL.JSON_OBJECT(k, v), ',')).
+    # Exasol disallows SET SCRIPTs (emitting UDFs) in any expression context —
+    # including scalar subqueries and CTE projections referenced by outer
+    # expressions — so a "real" aggregate UDF can't model MariaDB JSON_OBJECTAGG.
+    # LISTAGG is a built-in aggregate (expression-safe); pairing it with the
+    # scalar UTIL.JSON_OBJECT per-row stringifier and a scalar UTIL.JSON_OBJECTAGG
+    # merge keeps the whole rewrite expression-safe.
+    if len(args) == 2:
+        per_row = exp.Anonymous(this="UTIL.JSON_OBJECT", expressions=list(args))
+        listagg = exp.Anonymous(
+            this="LISTAGG",
+            expressions=[per_row, exp.Literal.string(",")],
+        )
+        return exp.Anonymous(this="UTIL.JSON_OBJECTAGG", expressions=[listagg])
+    return exp.Anonymous(this="UTIL.JSON_OBJECTAGG", expressions=args)
 
 
 def _strip_sql_quotes(rendered):
