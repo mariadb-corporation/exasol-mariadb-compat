@@ -60,8 +60,14 @@ def _rewrite_to_util(node):
     if isinstance(node, exp.JSONObject):
         args = []
         for kv in node.expressions:
-            args.append(kv.this)
-            args.append(kv.expression)
+            k = kv.this
+            v = kv.expression
+            if isinstance(k, exp.Expression):
+                k = k.transform(_rewrite_to_util)
+            if isinstance(v, exp.Expression):
+                v = v.transform(_rewrite_to_util)
+            args.append(k)
+            args.append(v)
         return exp.Anonymous(this="UTIL.JSON_OBJECT", expressions=args)
 
     if (isinstance(node, exp.Anonymous)

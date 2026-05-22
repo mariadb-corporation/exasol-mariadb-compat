@@ -91,10 +91,22 @@ def _rewrite_to_util(node):
         )
 
     if isinstance(node, exp.JSONObject):
+        # Same transform-doesn't-recurse-into-replacements hazard as JSON_UNQUOTE
+        # below — recurse explicitly into each key/value so nested
+        # JSON_OBJECT(...) (and JSON_EXTRACT, ELT, ...) calls inside the args
+        # still get rewritten to their UTIL.* form. Without this, only the
+        # outermost JSONObject is rewritten and inner ones leak `key: value`
+        # colon syntax that Exasol's parser rejects with "unexpected ':'".
         args = []
         for kv in node.expressions:
-            args.append(kv.this)
-            args.append(kv.expression)
+            k = kv.this
+            v = kv.expression
+            if isinstance(k, exp.Expression):
+                k = k.transform(_rewrite_to_util)
+            if isinstance(v, exp.Expression):
+                v = v.transform(_rewrite_to_util)
+            args.append(k)
+            args.append(v)
         return exp.Anonymous(this="UTIL.JSON_OBJECT", expressions=args)
 
     if (isinstance(node, exp.Anonymous)
