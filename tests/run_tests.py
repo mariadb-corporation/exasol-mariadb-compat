@@ -669,12 +669,12 @@ def main() -> int:
             if [[str(x) for x in r] for r in rows] == [[str(x) for x in r] for r in expected]:
                 print(f"[ok]   {label}")
                 if args.verbose:
-                    print(f"       actual  : {rows}")
+                    print(f"       exasol  : {rows}")
                 passed += 1
             else:
                 print(f"[FAIL] {label}", file=sys.stderr)
                 print(f"       expected: {expected}", file=sys.stderr)
-                print(f"       actual  : {rows}", file=sys.stderr)
+                print(f"       exasol  : {rows}", file=sys.stderr)
                 failed += 1
 
             if mc is not None:
