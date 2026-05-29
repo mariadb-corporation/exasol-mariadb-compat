@@ -47,21 +47,28 @@ def _rewrite_to_util(node):
         return exp.Var(this=node.name)
 
     if isinstance(node, exp.Set):
-        # MariaDB connectors emit `SET NAMES <charset> [COLLATE <c>]` as a
-        # connection-init handshake (client/server text encoding negotiation).
-        # Exasol has no equivalent — it stores everything as UTF-8 internally,
-        # and rejects standalone `SET <var>` / `SET ENCODING` via the WebSocket
-        # protocol with "syntax error, unexpected IDENTIFIER_PART_". Rewrite
-        # to a comment-only statement (Exasol parses comments as no-ops with
-        # result_type=rowCount), so the handshake silently succeeds.
+        # MariaDB connectors emit connection-init / session-config SETs as part
+        # of the handshake: `SET NAMES <charset> [COLLATE <c>]`, `SET CHARACTER
+        # SET <c>`, and `SET [SESSION|GLOBAL] <var> = <value>` (autocommit,
+        # sql_mode, time_zone, character_set_*, ...). Exasol has no equivalent —
+        # its only SQL `SET` is `ALTER SESSION SET`, and a bare `SET <var>` is
+        # rejected over the wire with "syntax error, unexpected IDENTIFIER_PART_"
+        # (verified: every form of `SET AUTOCOMMIT`, quoted or not, ON/OFF/0,
+        # fails). Rewrite the whole statement to a comment-only no-op (Exasol
+        # parses comments with result_type=rowCount) so the handshake silently
+        # succeeds. `SET TRANSACTION` (kind='TRANSACTION', no assignment) and
+        # `SET PASSWORD`/`SET ROLE` (parse as Command) don't match and pass
+        # through unchanged.
         items = node.expressions or []
-        if (len(items) == 1
-                and isinstance(items[0], exp.SetItem)
-                and items[0].args.get("kind") == "NAMES"):
+        if items and all(
+                isinstance(it, exp.SetItem)
+                and (it.args.get("kind") in ("NAMES", "CHARACTER SET")
+                     or isinstance(it.this, exp.EQ))
+                for it in items):
             return exp.Command(
                 this="--",
                 expression=exp.Literal.string(
-                    " mariadb SET NAMES is a no-op on Exasol"),
+                    " mariadb session SET is a no-op on Exasol"),
             )
 
     if isinstance(node, exp.CTE):

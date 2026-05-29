@@ -7,6 +7,21 @@ fixtures (`setup.exasol.sql` and/or `setup.mariadb.sql`), then one `<name>.sql`
 SELECT; the JSON file holds the expected rows as a list of lists. Rows are
 compared stringified so DECIMAL/int/float collapse.
 
+Connection:
+  default            run test SQL on Exasol via pyexasol-direct (--host:--port,
+                     default :8563).
+  --via-maxscale     run test SQL through MaxScale's Exasol router via a MariaDB
+                     client instead (--host/--port/--user/--password default to
+                     127.0.0.1/3311/admin_user/aBc123%%, connector default
+                     python_mariadb), exercising the in-MaxScale sqlglot/
+                     mariadb_preprocessor path. A pyexasol-direct control
+                     connection to Exasol (--exasol-*, default localhost:8563)
+                     still does the Exasol-native work — UDF reload, schema
+                     create/drop, catalog/CDC queries — since that can't
+                     round-trip through MaxScale's MariaDB preprocessor. Under
+                     --compare-*, the comparison client connects directly to
+                     MariaDB (--mariadb-*, default admin_user/aBc123%%).
+
 Modes:
   default            run cases on Exasol, compare to .expected.json.
   --compare-direct   additionally run each case against MariaDB (auto-spawns
@@ -75,6 +90,57 @@ class _PyexasolRunner:
         pass
 
 
+def _suggest_node_switch() -> str:
+    """Find the newest nvm-installed node >= 12.5 and return a copy-pasteable
+    `nvm use vX.Y.Z`; fall back to installing the LTS if none qualifies."""
+    import os
+    import pathlib
+    nvm = os.environ.get("NVM_DIR") or os.path.expanduser("~/.nvm")
+    best = None
+    try:
+        for d in (pathlib.Path(nvm) / "versions" / "node").iterdir():
+            try:
+                parts = tuple(int(x) for x in d.name.lstrip("v").split(".")[:3])
+            except ValueError:
+                continue
+            if parts[:2] >= (12, 5) and (best is None or parts > best[0]):
+                best = (parts, d.name)
+    except OSError:
+        pass
+    return f"nvm use {best[1]}" if best else "nvm install --lts && nvm use --lts"
+
+
+def _node_too_old(interp: str) -> str | None:
+    """Precheck for the nodejs connector: runner.js uses ES2021 numeric
+    separators, so node must be >= 12.5. Returns a human-readable reason if node
+    is missing or too old, else None (unknown/OK — let the runner try)."""
+    import shutil
+    import subprocess
+    if not shutil.which(interp):
+        return f"{interp!r} not found on PATH"
+    try:
+        ver = subprocess.run([interp, "--version"], capture_output=True, text=True,
+                             timeout=5).stdout.strip().lstrip("v")
+        major, minor = int(ver.split(".")[0]), int(ver.split(".")[1])
+    except Exception:
+        return None
+    if (major, minor) < (12, 5):
+        return (f"node {ver} is too old (runner.js needs >= 12.5 for numeric "
+                f"separators) — run: {_suggest_node_switch()}")
+    return None
+
+
+def _runner_start_hint(stderr: str) -> str:
+    """Map a runner's pre-ready stderr to a likely cause, appended to the error."""
+    low = stderr.lower()
+    if "invalid or unexpected token" in low:
+        return ("\n  -> likely an outdated interpreter (e.g. node < 12.5 can't parse "
+                f"runner.js) — run: {_suggest_node_switch()}")
+    if "cannot find module" in low or "modulenotfounderror" in low:
+        return "\n  -> likely missing dependencies — install the runner's deps first"
+    return ""
+
+
 class _SubprocessRunner:
     """Driver-mode JSON Lines runner — talks to a long-lived subprocess that
     implements the protocol documented under tests/connectors/README.md."""
@@ -82,15 +148,19 @@ class _SubprocessRunner:
     def __init__(self, name: str, cmd: list[str]):
         import subprocess
         self.name = name
-        self.proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, bufsize=1,
-        )
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"{name} runner: interpreter {cmd[0]!r} not found on PATH — is it installed?")
         # Wait for the ready/error event before driving requests through.
         first = self.proc.stdout.readline()
         if not first:
-            err = self.proc.stderr.read()
-            raise RuntimeError(f"{name} runner exited before ready: {err.strip()}")
+            err = (self.proc.stderr.read() or "").strip()
+            raise RuntimeError(f"{name} runner exited before ready: {err}{_runner_start_hint(err)}")
         evt = json.loads(first)
         if evt.get("event") == "error":
             raise RuntimeError(f"{name} runner connect failed: {evt.get('error')}")
@@ -173,6 +243,28 @@ def _is_local(host: str) -> bool:
     return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
 
 
+def _maxscale_sqlglot_version(container: str = "maxscale"):
+    """Best-effort: return the sqlglot version MaxScale uses to transpile (its
+    bundled site-packages, NOT the Exasol SLC's), by exec'ing into the MaxScale
+    container. Returns the version string, or None if no MaxScale container is
+    detected (docker missing or container absent)."""
+    import subprocess
+    cmd = ["docker", "exec",
+           "-e", "PYTHONPATH=/usr/lib64/maxscale/python3/site-packages",
+           container, "/usr/bin/python3.12", "-c",
+           "import sqlglot; print(sqlglot.__version__)"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None  # docker not installed / unresponsive
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    err = (r.stderr or r.stdout).strip()
+    if "no such container" in err.lower():
+        return None
+    return f"probe error: {err or 'no output'}"
+
+
 def _docker_available() -> bool:
     import subprocess
     try:
@@ -251,6 +343,10 @@ def _cdc_probe(c, mc, schema: str, timeout: float = 5.0) -> None:
     with mc.cursor() as mcur:
         mcur.execute(f"DROP TABLE IF EXISTS `{probe}`")
         mcur.execute(f"CREATE TABLE `{probe}` (id INT PRIMARY KEY)")
+        # MaxScale CDC streams DML row events, not bare DDL: an empty table never
+        # produces a change record, so the consumer never materializes it in
+        # Exasol. Insert a row to actually trigger the pipe.
+        mcur.execute(f"INSERT INTO `{probe}` (id) VALUES (1)")
     deadline = time.monotonic() + timeout
     found = False
     last_err: Exception | None = None
@@ -324,14 +420,121 @@ def _wait_for_cdc_propagation(c, mc, schema: str, tables: list[str], timeout: fl
     )
 
 
+def _resolve_connectors(args) -> list[str]:
+    """Expand --connector into a concrete list. 'all' = every connector valid
+    for the mode (pyexasol excluded under --via-maxscale, where it can't reach
+    MaxScale); a comma-separated list is taken verbatim; anything else is a
+    single connector."""
+    valid = ["pyexasol", *_CONNECTOR_RUNNERS]
+    if args.connector == "all":
+        return [c for c in valid if not (args.via_maxscale and c == "pyexasol")]
+    conns = [s.strip() for s in args.connector.split(",") if s.strip()]
+    bad = [c for c in conns if c not in valid]
+    if bad:
+        raise SystemExit(f"[setup] unknown connector(s) {bad}; choose from {valid} or 'all'")
+    return conns
+
+
+def _argv_without_connector(argv: list[str]) -> list[str]:
+    """Original CLI args minus the --connector option (so we can re-issue it
+    per connector when running several)."""
+    out, skip = [], False
+    for tok in argv:
+        if skip:
+            skip = False
+            continue
+        if tok == "--connector":
+            skip = True
+            continue
+        if tok.startswith("--connector="):
+            continue
+        out.append(tok)
+    return out
+
+
+def _run_many(args, connectors: list[str]) -> int:
+    """Run the suite once per connector — each a fresh subprocess so its setup
+    (schema, fixtures) is fully isolated — teeing output live, then print a
+    summary table. The UTIL.* UDFs live in their own schema and persist, so we
+    reload only on the first connector."""
+    import os
+    import re
+    import subprocess
+    base = [sys.executable, os.path.abspath(__file__)]
+    passthrough = _argv_without_connector(sys.argv[1:])
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    rows = []
+    for i, conn in enumerate(connectors):
+        argv = base + passthrough + ["--connector", conn]
+        if i > 0 and not args.no_reload:
+            argv.append("--no-reload")  # UTIL.* already loaded by the first run
+        print(f"\n==== connector: {conn} ====")
+        passed = total = None
+        note = ""
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, env=env)
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            m = re.search(r"(\d+)/(\d+) passed", line)
+            if m:
+                passed, total = int(m.group(1)), int(m.group(2))
+            if "unavailable:" in line:
+                note = "skipped — " + line.split("unavailable:", 1)[1].strip()
+            elif re.search(r"\[setup\].*(failed|unreachable|not detected)", line):
+                note = line.split("]", 1)[1].strip() if "]" in line else line.strip()
+        rc = proc.wait()
+        rows.append((conn, rc, passed, total, note))
+
+    print("\n==== summary ====")
+    w = max(len(c) for c, *_ in rows)
+    bad = False
+    for conn, rc, passed, total, note in rows:
+        if rc == 0:
+            result = f"{passed}/{total}" if total is not None else "passed"
+        elif note.startswith("skipped"):
+            result = note
+        elif rc == 1 and total is not None:
+            result = f"{passed}/{total}  ({total - passed} failed)"
+            bad = True
+        else:
+            result = note or f"error (exit {rc})"
+            bad = True
+        print(f"  {conn.ljust(w)}  {result}")
+    return 1 if bad else 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--host", default="localhost")
-    p.add_argument("--port", default="8563")
-    p.add_argument("--user", default="sys")
-    p.add_argument("--password", default="exasol")
+    p.add_argument("--host", default=None,
+                   help="Primary connection host. Default: localhost (Exasol direct), "
+                        "or 127.0.0.1 under --via-maxscale (MaxScale).")
+    p.add_argument("--port", default=None,
+                   help="Primary connection port. Default: 8563 (Exasol direct), "
+                        "or 3311 under --via-maxscale (MaxScale).")
+    p.add_argument("--user", default=None,
+                   help="Primary connection user. Default: sys (Exasol direct), "
+                        "or admin_user under --via-maxscale (MaxScale).")
+    p.add_argument("--password", default=None,
+                   help="Primary connection password. Default: exasol (Exasol direct), "
+                        "or aBc123%%%% under --via-maxscale (MaxScale).")
     p.add_argument("--no-ssl-verify", action="store_true",
                    help="Skip Exasol TLS cert validation (for docker-db's self-signed cert)")
+    p.add_argument("--via-maxscale", action="store_true",
+                   help="Route the primary connection through MaxScale's Exasol router "
+                        "(MariaDB wire protocol) instead of pyexasol-direct, exercising the "
+                        "in-MaxScale sqlglot/mariadb_preprocessor path. Flips the "
+                        "--host/--port/--user/--password defaults to MaxScale "
+                        "(127.0.0.1/3311/admin_user/aBc123%%%%) and runs all SQL via a MariaDB "
+                        "connector (--connector, default python_mariadb). The UTIL.* UDF bundle "
+                        "is still loaded into Exasol directly over the --exasol-* connection.")
+    p.add_argument("--exasol-host", default="localhost",
+                   help="Exasol host for the --via-maxscale UDF-reload connection (default: localhost)")
+    p.add_argument("--exasol-port", default="8563",
+                   help="Exasol port for the --via-maxscale UDF-reload connection (default: 8563)")
+    p.add_argument("--exasol-user", default="sys",
+                   help="Exasol user for the --via-maxscale UDF-reload connection (default: sys)")
+    p.add_argument("--exasol-password", default="exasol",
+                   help="Exasol password for the --via-maxscale UDF-reload connection (default: exasol)")
     p.add_argument("--script-language", default=None,
                    help="If set, run ALTER SESSION SET SCRIPT_LANGUAGES='<value>' before tests, "
                         "to pin the SLC under test (e.g. a custom-built one carrying a specific "
@@ -339,13 +542,13 @@ def main() -> int:
     p.add_argument("--tests-dir", type=Path, default=Path(__file__).parent,
                    help="Directory to scan for UDF test subdirs (default: this script's dir)")
     p.add_argument("--connector", default="pyexasol",
-                   choices=["pyexasol", *_CONNECTOR_RUNNERS.keys()],
-                   help="Which client executes test SQL. 'pyexasol' (default) "
-                        "talks Exasol direct on --port. Other values spawn a "
-                        "long-lived runner under tests/connectors/<name>/ and "
-                        "talk to it via JSON Lines on stdin/stdout. Connector "
-                        "runs go via MaxScale at --maxscale-host:--maxscale-port "
-                        "using --mariadb-user/--mariadb-password.")
+                   help="Which client executes test SQL: 'pyexasol' (default, Exasol "
+                        "direct on --port) or one of " + ", ".join(_CONNECTOR_RUNNERS)
+                        + " (spawn a runner under tests/connectors/<name>/, talking JSON "
+                        "Lines; these go via MaxScale at --maxscale-host:--maxscale-port "
+                        "using --mariadb-user/--mariadb-password). Pass a comma-separated "
+                        "list or 'all' to run several and print a summary table ('all' "
+                        "excludes pyexasol under --via-maxscale).")
     p.add_argument("--maxscale-host", default="127.0.0.1",
                    help="MaxScale host for non-pyexasol connectors (default: 127.0.0.1)")
     p.add_argument("--maxscale-port", type=int, default=3309,
@@ -382,8 +585,12 @@ def main() -> int:
                         "(--compare-with-cdc only; default: 5)")
     p.add_argument("--mariadb-host", default="127.0.0.1")
     p.add_argument("--mariadb-port", type=int, default=3306)
-    p.add_argument("--mariadb-user", default="root")
-    p.add_argument("--mariadb-password", default="")
+    p.add_argument("--mariadb-user", default=None,
+                   help="MariaDB comparison-connection user. Default: root, "
+                        "or admin_user under --via-maxscale.")
+    p.add_argument("--mariadb-password", default=None,
+                   help="MariaDB comparison-connection password. Default: empty, "
+                        "or aBc123%%%% under --via-maxscale.")
     p.add_argument("--mariadb-image", default="mariadb:11.8",
                    help="Image used to auto-spawn a container when --compare-direct can't reach "
                         "MariaDB (local hosts only). Default: mariadb:11.8")
@@ -391,16 +598,53 @@ def main() -> int:
                    help="Disable auto-spawning a MariaDB docker container under --compare-direct")
     args = p.parse_args()
 
-    connect_kwargs = dict(dsn=f"{args.host}:{args.port}", user=args.user,
-                          password=args.password, compression=True)
+    # Resolve primary-connection defaults: the Exasol WebSocket endpoint by
+    # default, or the MaxScale MariaDB endpoint under --via-maxscale. (Done
+    # post-parse so explicit flags still win in either mode.)
+    if args.via_maxscale:
+        args.host = args.host or "127.0.0.1"
+        args.port = args.port or "3311"
+        args.user = args.user or "admin_user"
+        args.password = "aBc123%%" if args.password is None else args.password
+        args.mariadb_user = args.mariadb_user or "admin_user"
+        args.mariadb_password = "aBc123%%" if args.mariadb_password is None else args.mariadb_password
+    else:
+        args.host = args.host or "localhost"
+        args.port = args.port or "8563"
+        args.user = args.user or "sys"
+        args.password = "exasol" if args.password is None else args.password
+        args.mariadb_user = args.mariadb_user or "root"
+        args.mariadb_password = "" if args.mariadb_password is None else args.mariadb_password
+
+    # 'all' / comma-list / single → list. Multiple connectors fan out to one
+    # subprocess each and report a summary table; a single connector runs inline.
+    connectors = _resolve_connectors(args)
+    if len(connectors) > 1:
+        return _run_many(args, connectors)
+    args.connector = connectors[0]
+
+    # The control connection `c` is always pyexasol direct to Exasol: it owns
+    # the Exasol-native work (UDF reload, CREATE/OPEN SCHEMA, catalog/CDC
+    # queries, DROP SCHEMA) that can't round-trip through MaxScale's MariaDB
+    # preprocessor. Under --via-maxscale it points at --exasol-* and test SQL
+    # runs over the MaxScale runner built below; otherwise it points at the
+    # primary --host/--port and (for the default connector) runs the tests too.
+    if args.via_maxscale:
+        exa_host, exa_port = args.exasol_host, args.exasol_port
+        exa_user, exa_pass = args.exasol_user, args.exasol_password
+    else:
+        exa_host, exa_port = args.host, args.port
+        exa_user, exa_pass = args.user, args.password
+    connect_kwargs = dict(dsn=f"{exa_host}:{exa_port}", user=exa_user,
+                          password=exa_pass, compression=True)
     if args.no_ssl_verify:
         import ssl
         connect_kwargs["websocket_sslopt"] = {"cert_reqs": ssl.CERT_NONE}
-
     try:
         c = pyexasol.connect(**connect_kwargs)
     except Exception as e:
-        print(f"[setup] connection failed: {e}", file=sys.stderr)
+        label = "Exasol control" if args.via_maxscale else "Exasol"
+        print(f"[setup] {label} connection ({exa_host}:{exa_port}) failed: {e}", file=sys.stderr)
         return 3
 
     if args.script_language:
@@ -429,32 +673,65 @@ def main() -> int:
         print(f"[setup] schema creation failed: {e}", file=sys.stderr)
         return 3
 
-    try:
-        gv = c.execute("SELECT UTIL.GET_GLOT_VERSION()").fetchall()
-        print(f"[setup] sqlglot in active SLC: {gv[0][0] if gv else 'unknown'}")
-    except Exception as e:
-        print(f"[setup] sqlglot version probe failed (UTIL.GET_GLOT_VERSION not installed?): {e}",
-              file=sys.stderr)
+    # The Exasol SLC's sqlglot is the transpiler only in pyexasol-direct mode.
+    # Under --via-maxscale, MaxScale transpiles, so the SLC version (here and in
+    # the runner probe below) is noise — skip it and report MaxScale's instead.
+    if not args.via_maxscale:
+        try:
+            gv = c.execute("SELECT UTIL.GET_GLOT_VERSION()").fetchall()
+            print(f"[setup] sqlglot in active SLC: {gv[0][0] if gv else 'unknown'}")
+        except Exception as e:
+            print(f"[setup] sqlglot version probe failed (UTIL.GET_GLOT_VERSION not installed?): {e}",
+                  file=sys.stderr)
 
-    # Build the test-execution runner. pyexasol reuses the existing connection
-    # (Exasol direct). Other connectors talk to MaxScale via a subprocess
-    # implementing the JSON Lines driver protocol.
-    if args.connector == "pyexasol":
+    # MaxScale's bundled sqlglot is what rewrites the SQL — the only version
+    # that matters under --via-maxscale. Always try to report it (the container
+    # may exist regardless of mode); say so cleanly if it isn't there.
+    mxver = _maxscale_sqlglot_version()
+    if mxver is None:
+        print("[setup] MaxScale docker container not detected; skipping its sqlglot version probe")
+    else:
+        print(f"[setup] sqlglot in MaxScale: {mxver}")
+
+    # Build the test-execution runner. The default pyexasol connector reuses the
+    # control connection (Exasol direct). Other connectors — and --via-maxscale —
+    # talk to MaxScale via a subprocess implementing the JSON Lines driver
+    # protocol. --via-maxscale points that subprocess at the primary
+    # --host/--port/--user/--password (MaxScale 3311) and defaults the connector
+    # to python_mariadb; plain connector mode uses --maxscale-*/--mariadb-*.
+    # NB: python_pymysql can't parse the exasolrouter's OK/non-result-set
+    # response packets (USE/SET return "Result: OK" but pymysql drops the
+    # connection); MariaDB Connector/Python handles them, so it's the default.
+    connector = args.connector
+    if args.via_maxscale and connector == "pyexasol":
+        connector = "python_mariadb"
+    if connector == "pyexasol":
         runner = _PyexasolRunner(c)
-    elif args.connector in _CONNECTOR_RUNNERS:
-        interp, script = _CONNECTOR_RUNNERS[args.connector]
-        runner_dir = Path(__file__).resolve().parent / "connectors" / args.connector
+    elif connector in _CONNECTOR_RUNNERS:
+        if args.via_maxscale:
+            mx_host, mx_port = args.host, str(args.port)
+            mx_user, mx_pass = args.user, args.password
+        else:
+            mx_host, mx_port = args.maxscale_host, str(args.maxscale_port)
+            mx_user, mx_pass = args.mariadb_user, args.mariadb_password
+        interp, script = _CONNECTOR_RUNNERS[connector]
+        if connector == "nodejs":
+            reason = _node_too_old(interp)
+            if reason:
+                print(f"[setup] nodejs connector unavailable: {reason}", file=sys.stderr)
+                return 3
+        runner_dir = Path(__file__).resolve().parent / "connectors" / connector
         cmd = [
             interp, str(runner_dir / script),
-            "--host", args.maxscale_host,
-            "--port", str(args.maxscale_port),
-            "--user", args.mariadb_user,
-            "--password", args.mariadb_password,
+            "--host", mx_host,
+            "--port", mx_port,
+            "--user", mx_user,
+            "--password", mx_pass,
         ]
         try:
-            runner = _SubprocessRunner(args.connector, cmd)
-            print(f"[setup] connector: {args.connector} ({runner.driver}) -> "
-                  f"{args.maxscale_host}:{args.maxscale_port}")
+            runner = _SubprocessRunner(connector, cmd)
+            print(f"[setup] connector: {connector} ({runner.driver}) -> "
+                  f"{mx_host}:{mx_port}")
             # The runner opens its own DB session over MaxScale, so the
             # SCRIPT_LANGUAGES pin we set on the pyexasol session above
             # does NOT apply here — re-issue it via the runner so UDF/
@@ -468,9 +745,9 @@ def main() -> int:
                 try:
                     runner.execute("__set_script_languages__", stmt)
                     if args.verbose >= 2:
-                        print(f"[setup] ({args.connector}) {stmt}")
+                        print(f"[setup] ({connector}) {stmt}")
                 except Exception as e:
-                    print(f"[setup] {args.connector}: SCRIPT_LANGUAGES pin "
+                    print(f"[setup] {connector}: SCRIPT_LANGUAGES pin "
                           f"failed ({e}); SLC may not match --script-language",
                           file=sys.stderr)
             # Connector lands in no schema by default; pyexasol pre-OPENs the
@@ -483,24 +760,27 @@ def main() -> int:
             try:
                 runner.execute("__use_schema__", f"USE {args.schema}")
             except Exception as e:
-                print(f"[setup] {args.connector}: USE {args.schema} failed "
+                print(f"[setup] {connector}: USE {args.schema} failed "
                       f"({e}); table-fixture tests in this run will fail",
                       file=sys.stderr)
             # Re-probe sqlglot version — the runner's session may be on a
             # different SLC than pyexasol's (different user, different
-            # server-side defaults via MaxScale, etc.), so report both.
-            try:
-                v = runner.execute("__glot_version__", "SELECT UTIL.GET_GLOT_VERSION()")
-                ver = v[0][0] if v and v[0] else "unknown"
-                print(f"[setup] sqlglot in {args.connector} runner SLC: {ver}")
-            except Exception as e:
-                print(f"[setup] sqlglot version probe via {args.connector} runner failed: {e}",
-                      file=sys.stderr)
+            # server-side defaults via MaxScale, etc.), so report both. Skipped
+            # under --via-maxscale: there the SLC isn't the transpiler (MaxScale
+            # is), so its version is reported via the MaxScale probe instead.
+            if not args.via_maxscale:
+                try:
+                    v = runner.execute("__glot_version__", "SELECT UTIL.GET_GLOT_VERSION()")
+                    ver = v[0][0] if v and v[0] else "unknown"
+                    print(f"[setup] sqlglot in {connector} runner SLC: {ver}")
+                except Exception as e:
+                    print(f"[setup] sqlglot version probe via {connector} runner failed: {e}",
+                          file=sys.stderr)
         except Exception as e:
             print(f"[setup] connector init failed: {e}", file=sys.stderr)
             return 3
     else:
-        print(f"[setup] unsupported connector: {args.connector}", file=sys.stderr)
+        print(f"[setup] unsupported connector: {connector}", file=sys.stderr)
         return 3
 
     compare_mode: str | None = None

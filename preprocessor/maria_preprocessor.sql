@@ -28,14 +28,22 @@ def _rewrite_to_util(node):
         return exp.Var(this=node.name)
 
     if isinstance(node, exp.Set):
+        # MariaDB connection-handshake / session-config SETs (SET NAMES,
+        # SET CHARACTER SET, SET [SESSION|GLOBAL] <var> = <value> such as
+        # autocommit / sql_mode / time_zone) have no Exasol equivalent and are
+        # rejected over the wire; rewrite to a comment no-op (Exasol parses
+        # comments with result_type=rowCount). SET TRANSACTION / SET PASSWORD
+        # don't match (no assignment / parse as Command) and pass through.
         items = node.expressions or []
-        if (len(items) == 1
-                and isinstance(items[0], exp.SetItem)
-                and items[0].args.get("kind") == "NAMES"):
+        if items and all(
+                isinstance(it, exp.SetItem)
+                and (it.args.get("kind") in ("NAMES", "CHARACTER SET")
+                     or isinstance(it.this, exp.EQ))
+                for it in items):
             return exp.Command(
                 this="--",
                 expression=exp.Literal.string(
-                    " mariadb SET NAMES is a no-op on Exasol"),
+                    " mariadb session SET is a no-op on Exasol"),
             )
 
     if isinstance(node, exp.CTE):
