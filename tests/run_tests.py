@@ -69,6 +69,7 @@ _CONNECTOR_RUNNERS = {
     "python_mariadb": ("python3", "runner.py"),
     "python_pymysql": ("python3", "runner.py"),
     "java":           ("bash",    "run.sh"),  # wrapper compiles Runner.java
+    "mariadb_c":      ("bash",    "run.sh"),  # wrapper compiles runner.c (libmariadb)
 }
 
 
