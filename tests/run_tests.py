@@ -70,6 +70,7 @@ _CONNECTOR_RUNNERS = {
     "python_pymysql": ("python3", "runner.py"),
     "java":           ("bash",    "run.sh"),  # wrapper compiles Runner.java
     "mariadb_c":      ("bash",    "run.sh"),  # wrapper compiles runner.c (libmariadb)
+    "mariadb_cpp":    ("bash",    "run.sh"),  # wrapper compiles runner.cpp (Connector/C++)
 }
 
 
@@ -783,6 +784,18 @@ def main() -> int:
     else:
         print(f"[setup] unsupported connector: {connector}", file=sys.stderr)
         return 3
+
+    # Report the live MARIA_PREPROCESSOR build — versioned independently of
+    # sqlglot. The preprocessor answers `SELECT @@maria_preprocessor_version`
+    # in both the Exasol-SLC and MaxScale paths, so probe via the runner (the
+    # actual transpile path for this run). Best-effort: the preprocessor may not
+    # be active on a plain pyexasol session, in which case @@-vars don't parse.
+    try:
+        pv = runner.execute("__preproc_version__", "SELECT @@maria_preprocessor_version")
+        pver = pv[0][0] if pv and pv[0] else "unknown"
+        print(f"[setup] MARIA_PREPROCESSOR via {connector}: {pver}")
+    except Exception as e:
+        print(f"[setup] MARIA_PREPROCESSOR version probe failed: {e}", file=sys.stderr)
 
     compare_mode: str | None = None
     if args.compare_direct:
