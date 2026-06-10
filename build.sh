@@ -11,16 +11,22 @@ cd "$(dirname "$0")"
 OUT="dist/mariadb-compat.sql"
 VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo 'dev')"
 
+# Build tag for the preprocessor stamp: the HEAD commit that the preprocessor
+# sources are at. -dirty only when preprocessor/ itself has uncommitted edits —
+# scoped to those files so unrelated working-tree changes (.gitignore, tests,
+# ...) don't taint the tag. Computed BEFORE the in-place stamp below, so a clean
+# preprocessor/ yields a clean hash; commit the stamp to keep it that way.
+BUILD_TAG="$(git rev-parse --short HEAD 2>/dev/null || echo 'dev')"
+git diff --quiet HEAD -- preprocessor 2>/dev/null || BUILD_TAG="${BUILD_TAG}-dirty"
+
 mkdir -p dist
 
-# Stamp the preprocessor build tag into the standalone source files in place so
+# Stamp the build tag into the standalone source files in place so
 # `SELECT @@maria_preprocessor_version` reports this build everywhere the source
 # is used directly — install.py and the hand-copied MaxScale sqlglot.custom.udf,
 # not just the dist bundle. Matches the line at any current value (re-stampable).
-# NB: this leaves the tracked sources differing from HEAD, so `git describe
-# --dirty` will report -dirty on subsequent builds until the stamp is committed.
 for f in preprocessor/*.sql; do
-    sed -i -E "s|^(_PREPROCESSOR_BUILD = ).*|\1\"${VERSION}\"|" "$f"
+    sed -i -E "s|^(_PREPROCESSOR_BUILD = ).*|\1\"${BUILD_TAG}\"|" "$f"
 done
 
 {
