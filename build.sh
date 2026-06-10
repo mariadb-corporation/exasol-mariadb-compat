@@ -9,7 +9,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 OUT="dist/mariadb-compat.sql"
-VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo 'dev')"
+VERSION="$(git describe --tags --always 2>/dev/null || echo 'dev')"
+# -dirty only when the bundle's own sources (udfs/, preprocessor/) have
+# uncommitted edits — unrelated working-tree changes don't taint the header.
+git diff --quiet HEAD -- udfs preprocessor 2>/dev/null || VERSION="${VERSION}-dirty"
 
 # Build tag for the preprocessor stamp: the HEAD commit that the preprocessor
 # sources are at. -dirty only when preprocessor/ itself has uncommitted edits —
