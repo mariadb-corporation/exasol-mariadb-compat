@@ -5,6 +5,10 @@ import sqlglot
 from sqlglot import expressions as exp
 
 
+_PREPROCESSOR_VERSION = "1.0.0"
+_PREPROCESSOR_BUILD = "1681fe6"
+
+
 def adapter_call(request):
     try:
         return _transpile(request)
@@ -12,10 +16,43 @@ def adapter_call(request):
         return request
 
 
+_SYSVAR_VALUES = {
+    "max_allowed_packet": "16777216",
+    "auto_increment_increment": "1",
+    "system_time_zone": "UTC",
+    "time_zone": "+00:00",
+}
+
+
+def _rewrite_session_var_select(tree):
+    if not isinstance(tree, exp.Select):
+        return None
+    projs = tree.expressions
+    if not projs or not all(isinstance(e, exp.SessionParameter) for e in projs):
+        return None
+    if len(projs) == 1 and projs[0].sql(dialect="mysql").lstrip("@").lower() == "maria_preprocessor_version":
+        ver = _PREPROCESSOR_VERSION + "_" + _PREPROCESSOR_BUILD
+        return "SELECT '" + ver.replace("'", "''") + "'"
+    cols = []
+    for sp in projs:
+        key = sp.sql(dialect="mysql").lstrip("@").lower()
+        val = _SYSVAR_VALUES.get(key)
+        if val is None:
+            cols.append("NULL")
+        elif val.isdigit():
+            cols.append(val)
+        else:
+            cols.append("'" + val.replace("'", "''") + "'")
+    return "SELECT " + ", ".join(cols)
+
+
 def _transpile(request):
     tree = sqlglot.parse_one(request, read="mysql")
     if tree is None:
         return request
+    sysvars = _rewrite_session_var_select(tree)
+    if sysvars is not None:
+        return sysvars
     tree = tree.transform(_rewrite_to_util)
     return tree.sql(dialect="exasol", identify=True)
 
@@ -29,13 +66,15 @@ def _rewrite_to_util(node):
 
     if isinstance(node, exp.Set):
         items = node.expressions or []
-        if (len(items) == 1
-                and isinstance(items[0], exp.SetItem)
-                and items[0].args.get("kind") == "NAMES"):
+        if items and all(
+                isinstance(it, exp.SetItem)
+                and (it.args.get("kind") in ("NAMES", "CHARACTER SET")
+                     or isinstance(it.this, exp.EQ))
+                for it in items):
             return exp.Command(
                 this="--",
                 expression=exp.Literal.string(
-                    " mariadb SET NAMES is a no-op on Exasol"),
+                    " mariadb session SET is a no-op on Exasol"),
             )
 
     if isinstance(node, exp.CTE):
@@ -137,13 +176,6 @@ def _rewrite_to_util(node):
 
 
 def _wrap_json_objectagg(args):
-    # Build UTIL.JSON_OBJECTAGG(LISTAGG(UTIL.JSON_OBJECT(k, v), ',')).
-    # Exasol disallows SET SCRIPTs (emitting UDFs) in any expression context —
-    # including scalar subqueries and CTE projections referenced by outer
-    # expressions — so a "real" aggregate UDF can't model MariaDB JSON_OBJECTAGG.
-    # LISTAGG is a built-in aggregate (expression-safe); pairing it with the
-    # scalar UTIL.JSON_OBJECT per-row stringifier and a scalar UTIL.JSON_OBJECTAGG
-    # merge keeps the whole rewrite expression-safe.
     if len(args) == 2:
         per_row = exp.Anonymous(this="UTIL.JSON_OBJECT", expressions=list(args))
         listagg = exp.Anonymous(

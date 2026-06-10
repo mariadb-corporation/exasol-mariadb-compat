@@ -11,3 +11,5 @@ tests/connectors/*/node_modules/
 tests/connectors/*/.venv/
 tests/connectors/*/lib/
 tests/connectors/java/*.class
+tests/connectors/mariadb_c/runner
+tests/connectors/mariadb_cpp/runner

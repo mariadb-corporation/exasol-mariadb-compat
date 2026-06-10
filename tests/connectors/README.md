@@ -48,8 +48,10 @@ Per-request lines (one per stdin line, in order):
 | `python_mariadb/` | `mariadb-connector-python` (libmariadb-backed) | `pip install -r python_mariadb/requirements.txt` |
 | `python_pymysql/` | `pymysql` (pure Python) | `pip install -r python_pymysql/requirements.txt` |
 | `java/`           | MariaDB Connector/J (JDBC) | `cd java && ./fetch-deps.sh` (needs JDK 11+ on PATH) |
+| `mariadb_c/`      | MariaDB Connector/C (libmariadb) | needs a C compiler + `mariadb_config` (Connector/C dev) on PATH; `run.sh` compiles `runner.c` on first use |
+| `mariadb_cpp/`    | MariaDB Connector/C++ (libmariadbcpp) | `cd mariadb_cpp && ./fetch-deps.sh` (source-build Connector/C++ to /usr/local); `run.sh` compiles `runner.cpp` on first use |
 
-(More to come — c, c++, odbc.)
+(More to come — odbc.)
 
 ## Master-side invocation
 

@@ -19,14 +19,70 @@ import sqlglot
 from sqlglot import expressions as exp
 
 
+# Version of the preprocessor REWRITE LOGIC — bump on every behavioural change.
+# Independent of the bundled sqlglot version (UTIL.GET_GLOT_VERSION): the
+# preprocessor source changes on its own cadence, so it carries its own number.
+# build.sh substitutes the "dev" build tag with the git describe string at
+# bundle time, and the SLC-installed copy and the MaxScale-mounted copy each
+# report their own value, so a version mismatch between two live deployments is
+# immediately visible. Read it from any MariaDB client (incl. through MaxScale)
+# with `SELECT @@maria_preprocessor_version` — the branch in
+# _rewrite_session_var_select below answers it with a canned SELECT.
+# NB: production maria_preprocessor.sql keeps these same statements but with NO
+# comments — the documentation lives here in the debug variant only.
+_PREPROCESSOR_VERSION = "1.0.0"
+_PREPROCESSOR_BUILD = "1681fe6"
+
+
 def adapter_call(request):
     return _transpile(request)
+
+
+_SYSVAR_VALUES = {
+    "max_allowed_packet": "16777216",
+    "auto_increment_increment": "1",
+    "system_time_zone": "UTC",
+    "time_zone": "+00:00",
+}
+
+
+def _rewrite_session_var_select(tree):
+    # MariaDB Connector/C++ and /J load session state at connect with
+    # `SELECT @@max_allowed_packet, @@system_time_zone, @@time_zone,
+    # @@auto_increment_increment` and abort if it fails — but Exasol has no
+    # @@-variables. The connector reads the columns by position, so answer with
+    # canned constants to let the handshake complete. Returns rewritten SQL, or
+    # None if this isn't an all-@@-variable SELECT.
+    if not isinstance(tree, exp.Select):
+        return None
+    projs = tree.expressions
+    if not projs or not all(isinstance(e, exp.SessionParameter) for e in projs):
+        return None
+    # `SELECT @@maria_preprocessor_version` -> the canned version string. Lets
+    # any client read which preprocessor build is live, independent of sqlglot.
+    if len(projs) == 1 and projs[0].sql(dialect="mysql").lstrip("@").lower() == "maria_preprocessor_version":
+        ver = _PREPROCESSOR_VERSION + "_" + _PREPROCESSOR_BUILD
+        return "SELECT '" + ver.replace("'", "''") + "'"
+    cols = []
+    for sp in projs:
+        key = sp.sql(dialect="mysql").lstrip("@").lower()
+        val = _SYSVAR_VALUES.get(key)
+        if val is None:
+            cols.append("NULL")
+        elif val.isdigit():
+            cols.append(val)
+        else:
+            cols.append("'" + val.replace("'", "''") + "'")
+    return "SELECT " + ", ".join(cols)
 
 
 def _transpile(request):
     tree = sqlglot.parse_one(request, read="mysql")
     if tree is None:
         return request
+    sysvars = _rewrite_session_var_select(tree)
+    if sysvars is not None:
+        return sysvars
     tree = tree.transform(_rewrite_to_util)
     return tree.sql(dialect="exasol", identify=True)
 
@@ -47,21 +103,28 @@ def _rewrite_to_util(node):
         return exp.Var(this=node.name)
 
     if isinstance(node, exp.Set):
-        # MariaDB connectors emit `SET NAMES <charset> [COLLATE <c>]` as a
-        # connection-init handshake (client/server text encoding negotiation).
-        # Exasol has no equivalent — it stores everything as UTF-8 internally,
-        # and rejects standalone `SET <var>` / `SET ENCODING` via the WebSocket
-        # protocol with "syntax error, unexpected IDENTIFIER_PART_". Rewrite
-        # to a comment-only statement (Exasol parses comments as no-ops with
-        # result_type=rowCount), so the handshake silently succeeds.
+        # MariaDB connectors emit connection-init / session-config SETs as part
+        # of the handshake: `SET NAMES <charset> [COLLATE <c>]`, `SET CHARACTER
+        # SET <c>`, and `SET [SESSION|GLOBAL] <var> = <value>` (autocommit,
+        # sql_mode, time_zone, character_set_*, ...). Exasol has no equivalent —
+        # its only SQL `SET` is `ALTER SESSION SET`, and a bare `SET <var>` is
+        # rejected over the wire with "syntax error, unexpected IDENTIFIER_PART_"
+        # (verified: every form of `SET AUTOCOMMIT`, quoted or not, ON/OFF/0,
+        # fails). Rewrite the whole statement to a comment-only no-op (Exasol
+        # parses comments with result_type=rowCount) so the handshake silently
+        # succeeds. `SET TRANSACTION` (kind='TRANSACTION', no assignment) and
+        # `SET PASSWORD`/`SET ROLE` (parse as Command) don't match and pass
+        # through unchanged.
         items = node.expressions or []
-        if (len(items) == 1
-                and isinstance(items[0], exp.SetItem)
-                and items[0].args.get("kind") == "NAMES"):
+        if items and all(
+                isinstance(it, exp.SetItem)
+                and (it.args.get("kind") in ("NAMES", "CHARACTER SET")
+                     or isinstance(it.this, exp.EQ))
+                for it in items):
             return exp.Command(
                 this="--",
                 expression=exp.Literal.string(
-                    " mariadb SET NAMES is a no-op on Exasol"),
+                    " mariadb session SET is a no-op on Exasol"),
             )
 
     if isinstance(node, exp.CTE):
