@@ -20,9 +20,20 @@ import sys
 import time
 
 SITE_PACKAGES = "/usr/lib64/maxscale/python3/site-packages"
-CONTAINER_PYTHON = "/usr/bin/python3.12"
 LISTENER_PORT = 3311  # exasol_listener in maxscale.cnf — used for the readiness wait
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _container_python(container: str) -> str:
+    """Resolve the container's python3 binary (the image version drifts, e.g.
+    3.12 -> 3.13), falling back to the newest /usr/bin/python3.* if there is no
+    bare python3 on PATH."""
+    r = subprocess.run(
+        ["docker", "exec", container, "sh", "-c",
+         "command -v python3 || ls -1 /usr/bin/python3.[0-9]* 2>/dev/null | "
+         "grep -E '/python3\\.[0-9]+$' | sort -V | tail -1"],
+        capture_output=True, text=True)
+    return r.stdout.strip() or "python3"
 
 
 def _dexec_root(container: str, sh: str):
@@ -35,7 +46,7 @@ def _dexec_root(container: str, sh: str):
 def _container_version(container: str) -> str:
     r = subprocess.run(
         ["docker", "exec", "-e", f"PYTHONPATH={SITE_PACKAGES}",
-         container, CONTAINER_PYTHON, "-c", "import sqlglot; print(sqlglot.__version__)"],
+         container, _container_python(container), "-c", "import sqlglot; print(sqlglot.__version__)"],
         capture_output=True, text=True)
     if r.returncode == 0 and r.stdout.strip():
         return r.stdout.strip()

@@ -251,10 +251,15 @@ def _maxscale_sqlglot_version(container: str = "maxscale"):
     container. Returns the version string, or None if no MaxScale container is
     detected (docker missing or container absent)."""
     import subprocess
+    # Resolve the container's python3 inside the same exec — the image version
+    # drifts (e.g. 3.12 -> 3.13), so don't hardcode the path. Prefer a bare
+    # python3 on PATH, else the newest /usr/bin/python3.*.
     cmd = ["docker", "exec",
            "-e", "PYTHONPATH=/usr/lib64/maxscale/python3/site-packages",
-           container, "/usr/bin/python3.12", "-c",
-           "import sqlglot; print(sqlglot.__version__)"]
+           container, "sh", "-c",
+           "PY=$(command -v python3 || ls -1 /usr/bin/python3.[0-9]* 2>/dev/null | "
+           "grep -E '/python3\\.[0-9]+$' | sort -V | tail -1); "
+           "exec \"${PY:-python3}\" -c 'import sqlglot; print(sqlglot.__version__)'"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     except (FileNotFoundError, subprocess.TimeoutExpired):

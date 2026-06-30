@@ -26,7 +26,13 @@ import sys
 # Container paths (where MaxScale keeps its python + the deployed preprocessor).
 SITE_PACKAGES = "/usr/lib64/maxscale/python3/site-packages"
 PREPROCESSOR_DIR = "/usr/share/maxscale"
-CONTAINER_PYTHON = "/usr/bin/python3.12"
+# Resolve the container's python3 at runtime — the image version drifts
+# (e.g. 3.12 -> 3.13), so don't hardcode the path.
+CONTAINER_PYTHON_RESOLVE = (
+    "PY=$(command -v python3 || ls -1 /usr/bin/python3.[0-9]* 2>/dev/null | "
+    "grep -E '/python3\\.[0-9]+$' | sort -V | tail -1); "
+    'exec "${PY:-python3}" -c "$ADHOC_PROG"'
+)
 
 # Runs inside the container. Everything is passed via env vars so no SQL or
 # path ever has to be escaped into this program string.
@@ -64,7 +70,8 @@ def main() -> int:
         "-e", f"ADHOC_PRE_DIR={PREPROCESSOR_DIR}",
         "-e", f"ADHOC_SQL={sql}",
         "-e", f"ADHOC_SAFE={'1' if args.safe else '0'}",
-        args.container, CONTAINER_PYTHON, "-c", CONTAINER_PROGRAM,
+        "-e", f"ADHOC_PROG={CONTAINER_PROGRAM}",
+        args.container, "sh", "-c", CONTAINER_PYTHON_RESOLVE,
     ]
     try:
         return subprocess.run(cmd).returncode
