@@ -15,6 +15,7 @@ CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT UTIL.MARIA_PREPROCESSOR_DEBUG AS
 # adapter_call differs. If you change rules in one, change them in the other.
 
 import json
+import re
 import sqlglot
 from sqlglot import expressions as exp
 
@@ -31,7 +32,7 @@ from sqlglot import expressions as exp
 # NB: production maria_preprocessor.sql keeps these same statements but with NO
 # comments — the documentation lives here in the debug variant only.
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "7c6d449-dirty"
+_PREPROCESSOR_BUILD = "33b4b39-dirty"
 
 
 def adapter_call(request):
@@ -76,7 +77,161 @@ def _rewrite_session_var_select(tree):
     return "SELECT " + ", ".join(cols)
 
 
+# DbVisualizer (and other MariaDB clients) prepend a per-statement hint
+# wrapper: `SET STATEMENT SQL_SELECT_LIMIT=20000 FOR SELECT ...`. sqlglot has
+# no parse rule for the form, so parse_one degrades the WHOLE statement to a
+# generic exp.Command and it reaches Exasol verbatim — which rejects it with
+# "syntax error, unexpected STATEMENT_". Note the exp.Set no-op branch in
+# _rewrite_to_util does NOT catch this: that fires on exp.Set, this is Command.
+#
+# Exasol has no session-hint equivalent, so the variables are dropped outright
+# and only <stmt> is transpiled. Notably SQL_SELECT_LIMIT is discarded rather
+# than translated into a LIMIT: injecting one would change result semantics for
+# statements that already carry a LIMIT/FETCH FIRST, and the client still stops
+# reading at its own row cap. The cost is that Exasol computes the full result
+# set rather than stopping early.
+#
+# The scan can't be a plain regex up to /FOR/ because the var list may contain
+# string literals ("SET STATEMENT x='a FOR b' FOR SELECT ..."), so track quote
+# state ('/"/backtick, with doubled- and backslash-escapes) and paren depth and
+# split on the first FOR keyword at depth 0 outside any quote.
+#
+# It also has to understand comments, in BOTH positions: JDBC tooling routinely
+# prepends "/* app */" before the statement (which defeats an anchored ^\s*SET
+# match, so the wrapper survives and Exasol rejects it exactly as before the
+# fix), and a comment inside the var list would otherwise be scanned as if it
+# were SQL — "SET STATEMENT a=1 /* FOR */ FOR ..." split on the commented-out
+# FOR and produced the garbage "*/ FOR SELECT 1".
+#
+# We deliberately do NOT use sqlglot.tokenize() here, even though it handles all
+# of this correctly. Measured on the deployed 30.11.0: tokenizing a 20-line
+# DbVisualizer query costs ~600us against a ~895us parse+generate budget (+67%
+# latency), because it lexes the whole statement. This scanner stops at the
+# first FOR, so it is O(var-list prefix) — ~5us on the same query, ~0.3us to
+# reject a non-wrapper. Correctness here is worth ten lines, not 120x.
+_SET_STATEMENT_RE = re.compile(r"\s*SET\s+STATEMENT\s+", re.IGNORECASE)
+
+
+def _skip_ws_comments(sql, i):
+    # Advance past any run of whitespace and comments, returning the new index.
+    # Handles MariaDB's three comment forms: `# ...`, `-- ...` (both to EOL) and
+    # `/* ... */`. An unterminated comment swallows the rest of the string.
+    # NB: /*! ... */ executable comments are treated as plain comments — they
+    # only ever appear in the discarded prefix, and Exasol wouldn't honour a
+    # MySQL versioned hint anyway.
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+        elif ch == "#" or sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            break
+    return i
+
+
+# MariaDB applies sql_select_limit to the outermost result of a SELECT, and it
+# is the ONLY variable in the SET STATEMENT list with an Exasol equivalent, so
+# it is the only one translated — the rest are dropped. That is not laziness:
+# max_statement_time maps to Exasol QUERY_TIMEOUT but only via a separate
+# ALTER SESSION statement, and the preprocessor is strictly one-statement-in /
+# one-statement-out; foreign_key_checks and sql_mode have no analogue at all.
+#
+# Dropping it outright (the original behaviour) is not viable: the router
+# fetches the WHOLE result set before anything downstream can stop reading, so
+# "SET STATEMENT SQL_SELECT_LIMIT=10 FOR SELECT * FROM orders" became an
+# unbounded scan — measured at 272s for 100k rows versus 1ms on MariaDB, on
+# every DbVisualizer preview.
+#
+# Values are recovered from `seen`, which accumulates only the UNQUOTED,
+# UNCOMMENTED characters of the variable list, so a string value that happens to
+# contain "sql_select_limit=5" cannot be misread as the real setting. The regex
+# requires a digit, so `sql_select_limit=DEFAULT` (MariaDB's reset-to-unlimited)
+# correctly yields no limit. The last assignment wins, matching MariaDB.
+_SQL_SELECT_LIMIT_RE = re.compile(
+    r"(?:^|,)\s*(?:@@)?(?:(?:session|local)\.)?sql_select_limit\s*=\s*(\d+)",
+    re.IGNORECASE)
+
+
+def _strip_set_statement(sql):
+    # Returns (inner_statement, sql_select_limit_or_None).
+    m = _SET_STATEMENT_RE.match(sql, _skip_ws_comments(sql, 0))
+    if not m:
+        return sql, None
+    i = m.end()
+    n = len(sql)
+    depth = 0
+    quote = ""
+    delim = True
+    seen = []
+    while i < n:
+        ch = sql[i]
+        if quote:
+            if ch == "\\" and quote != "`":
+                i += 1
+            elif ch == quote:
+                if i + 1 < n and sql[i + 1] == quote:
+                    i += 1          # doubled quote -> escaped, stay in string
+                else:
+                    quote = ""
+            i += 1
+            continue
+        j = _skip_ws_comments(sql, i)
+        if j > i:
+            i = j
+            delim = True
+            seen.append(" ")
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            seen.append(" ")       # blank out quoted values, see above
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch in ",=":
+            delim = True
+            seen.append(ch)
+            i += 1
+            continue
+        elif depth == 0 and delim and sql[i:i + 3].upper() == "FOR":
+            after = sql[i + 3:i + 4]
+            if not (after.isalnum() or after == "_"):
+                # lstrip() only, not _skip_ws_comments: a comment that belongs
+                # to the payload ("FOR /*hint*/ SELECT") is the user's, and
+                # sqlglot parses it fine — don't silently eat it.
+                return sql[i + 3:].lstrip(), _select_limit_of("".join(seen))
+        else:
+            seen.append(ch)
+        delim = False
+        i += 1
+    # Malformed / no FOR keyword: leave untouched and let it fail naturally
+    # rather than silently mangling the statement.
+    return sql, None
+
+
+def _select_limit_of(vars_text):
+    m = None
+    for m in _SQL_SELECT_LIMIT_RE.finditer(vars_text):
+        pass
+    return int(m.group(1)) if m else None
+
+
+# exp.SetOperation is the base of Union/Except/Intersect. MariaDB caps the
+# combined result of a set operation, and those parse to SetOperation, NOT
+# exp.Select — an isinstance(tree, exp.Select) check alone would skip them and
+# let the unbounded scan straight back in. Guarded with getattr for older
+# sqlglot builds that only expose exp.Union.
+_SET_OPERATION = getattr(exp, "SetOperation", exp.Union)
+
+
 def _transpile(request):
+    request, select_limit = _strip_set_statement(request)
     tree = sqlglot.parse_one(request, read="mysql")
     if tree is None:
         return request
@@ -84,6 +239,16 @@ def _transpile(request):
     if sysvars is not None:
         return sysvars
     tree = tree.transform(_rewrite_to_util)
+    # An explicit LIMIT in the statement WINS over sql_select_limit in MariaDB,
+    # even when it is larger (verified: sql_select_limit=3 with LIMIT 7 returns
+    # 7 rows). So this must never overwrite an existing limit — tree.limit()
+    # would silently replace it and return the wrong rows, not merely more of
+    # them. SHOW/INSERT/DDL have no .limit() and fall through untouched; MariaDB
+    # does cap SHOW, so that stays a known, accepted divergence.
+    if (select_limit is not None
+            and isinstance(tree, (exp.Select, _SET_OPERATION))
+            and not tree.args.get("limit")):
+        tree = tree.limit(select_limit)
     return tree.sql(dialect="exasol", identify=True)
 
 
