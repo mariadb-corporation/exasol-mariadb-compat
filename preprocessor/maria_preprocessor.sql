@@ -7,7 +7,7 @@ from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "364dda7-dirty"
+_PREPROCESSOR_BUILD = "b9dc2d0-dirty"
 
 
 def adapter_call(request):
@@ -104,6 +104,16 @@ def _rewrite_show_engines(tree):
             + _sql_string("YES") + ", " + _sql_string("NO") + ", "
             + _sql_string("NO") + ")) AS t("
             + '"Engine", "Support", "Comment", "Transactions", "XA", "Savepoints")')
+
+
+def _rewrite_show_plugins(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "PLUGINS":
+        return None
+    return ("SELECT * FROM (VALUES ("
+            + _sql_string("EXASOL") + ", " + _sql_string("ACTIVE") + ", "
+            + _sql_string("STORAGE ENGINE") + ", CAST(NULL AS VARCHAR(64)), "
+            + _sql_string("PROPRIETARY") + ")) AS t("
+            + '"Name", "Status", "Type", "Library", "License")')
 
 
 _COLLATIONS = (
@@ -320,6 +330,9 @@ def _transpile(request):
     engines = _rewrite_show_engines(tree)
     if engines is not None:
         return engines
+    plugins = _rewrite_show_plugins(tree)
+    if plugins is not None:
+        return plugins
     procs = _rewrite_show_processlist(tree)
     if procs is not None:
         return procs
