@@ -7,7 +7,7 @@ from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "b9dc2d0-dirty"
+_PREPROCESSOR_BUILD = "f63b92b-dirty"
 
 
 def adapter_call(request):
@@ -93,6 +93,22 @@ def _rewrite_show_charset(tree):
     if like is not None:
         sql += ' WHERE UPPER("Charset") LIKE UPPER(' + _sql_string(like.name) + ')'
     return sql
+
+
+def _rewrite_show_create_table(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "CREATE TABLE":
+        return None
+    target = tree.args.get("target")
+    if target is None:
+        return None
+    db = tree.args.get("db")
+    schema = (' AND UPPER("TABLE_SCHEMA") = ' + _sql_string(db.name.upper())
+              if db is not None
+              else ' AND UPPER("TABLE_SCHEMA") = UPPER(CURRENT_SCHEMA)')
+    return ('SELECT "TABLE_NAME" AS "Table", "DDL" AS "Create Table"'
+            + ' FROM "UTIL"."SHOW_CREATE_TABLE"'
+            + ' WHERE UPPER("TABLE_NAME") = ' + _sql_string(target.name.upper())
+            + schema)
 
 
 def _rewrite_show_engines(tree):
@@ -327,6 +343,9 @@ def _transpile(request):
     collation = _rewrite_show_collation(tree)
     if collation is not None:
         return collation
+    create_table = _rewrite_show_create_table(tree)
+    if create_table is not None:
+        return create_table
     engines = _rewrite_show_engines(tree)
     if engines is not None:
         return engines
