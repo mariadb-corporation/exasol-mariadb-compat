@@ -7,7 +7,7 @@ from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "7449a11-dirty"
+_PREPROCESSOR_BUILD = "364dda7-dirty"
 
 
 def adapter_call(request):
@@ -92,6 +92,31 @@ def _rewrite_show_charset(tree):
     like = tree.args.get("like")
     if like is not None:
         sql += ' WHERE UPPER("Charset") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+_COLLATIONS = (
+    ("ascii_general_ci", "ascii", 11, "Yes"),
+    ("utf8mb4_general_ci", "utf8mb4", 45, "Yes"),
+)
+
+
+def _rewrite_show_collation(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "COLLATION":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(charset) + ", "
+        + str(ident) + ", " + _sql_string(default) + ", 'Yes', 1)"
+        for name, charset, ident, default in _COLLATIONS)
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Collation", "Charset", "Id", "Default", "Compiled", "Sortlen")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' WHERE UPPER("Collation") LIKE UPPER(' + _sql_string(like.name) + ')'
     return sql
 
 
@@ -278,6 +303,9 @@ def _transpile(request):
     charset = _rewrite_show_charset(tree)
     if charset is not None:
         return charset
+    collation = _rewrite_show_collation(tree)
+    if collation is not None:
+        return collation
     procs = _rewrite_show_processlist(tree)
     if procs is not None:
         return procs
