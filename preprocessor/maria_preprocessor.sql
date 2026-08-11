@@ -95,6 +95,17 @@ def _rewrite_show_charset(tree):
     return sql
 
 
+def _rewrite_show_engines(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "ENGINES":
+        return None
+    return ("SELECT * FROM (VALUES ("
+            + _sql_string("EXASOL") + ", " + _sql_string("DEFAULT") + ", "
+            + _sql_string("Exasol analytic database") + ", "
+            + _sql_string("YES") + ", " + _sql_string("NO") + ", "
+            + _sql_string("NO") + ")) AS t("
+            + '"Engine", "Support", "Comment", "Transactions", "XA", "Savepoints")')
+
+
 _COLLATIONS = (
     ("ascii_general_ci", "ascii", 11, "Yes"),
     ("utf8mb4_general_ci", "utf8mb4", 45, "Yes"),
@@ -306,6 +317,9 @@ def _transpile(request):
     collation = _rewrite_show_collation(tree)
     if collation is not None:
         return collation
+    engines = _rewrite_show_engines(tree)
+    if engines is not None:
+        return engines
     procs = _rewrite_show_processlist(tree)
     if procs is not None:
         return procs
