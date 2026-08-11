@@ -32,7 +32,7 @@ from sqlglot import expressions as exp
 # NB: production maria_preprocessor.sql keeps these same statements but with NO
 # comments — the documentation lives here in the debug variant only.
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "2246a94-dirty"
+_PREPROCESSOR_BUILD = "7449a11-dirty"
 
 
 def adapter_call(request):
@@ -140,6 +140,35 @@ def _rewrite_show_variables(tree):
     if like is not None:
         # MariaDB matches variable names case-insensitively, Exasol LIKE does not
         sql += ' WHERE UPPER("Variable_name") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+_CHARSETS = (
+    ("ascii", "US ASCII", "ascii_general_ci", 1),
+    ("utf8mb4", "UTF-8 Unicode", "utf8mb4_general_ci", 4),
+)
+
+
+def _rewrite_show_charset(tree):
+    # Exasol columns are either ASCII or UTF8, so those two are the whole truth
+    # here -- reporting MariaDB's full list of 40 charsets would offer clients
+    # (and their CREATE TABLE dropdowns) encodings Exasol cannot store. The
+    # default collation matches what the information_schema views claim.
+    if not isinstance(tree, exp.Show) or tree.name != "CHARACTER SET":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(desc) + ", "
+        + _sql_string(collation) + ", " + str(maxlen) + ")"
+        for name, desc, collation, maxlen in _CHARSETS)
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Charset", "Description", "Default collation", "Maxlen")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' WHERE UPPER("Charset") LIKE UPPER(' + _sql_string(like.name) + ')'
     return sql
 
 
@@ -376,6 +405,9 @@ def _transpile(request):
     showvars = _rewrite_show_variables(tree)
     if showvars is not None:
         return showvars
+    charset = _rewrite_show_charset(tree)
+    if charset is not None:
+        return charset
     procs = _rewrite_show_processlist(tree)
     if procs is not None:
         return procs
