@@ -32,7 +32,7 @@ from sqlglot import expressions as exp
 # NB: production maria_preprocessor.sql keeps these same statements but with NO
 # comments — the documentation lives here in the debug variant only.
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "33b4b39-dirty"
+_PREPROCESSOR_BUILD = "a1c1608-dirty"
 
 
 def adapter_call(request):
@@ -44,6 +44,11 @@ _SYSVAR_VALUES = {
     "auto_increment_increment": "1",
     "system_time_zone": "UTC",
     "time_zone": "+00:00",
+    # 2 = names stored as written, compared case-insensitively, which is what
+    # Exasol does under SQL_IDENTIFIER_COMPARISON = 'IGNORE CASE'. Reporting 0
+    # would tell clients identifiers are case-sensitive, making them quote names
+    # in whatever case they guessed.
+    "lower_case_table_names": "2",
 }
 
 
@@ -109,6 +114,35 @@ def _rewrite_session_var_select(tree):
 # latency), because it lexes the whole statement. This scanner stops at the
 # first FOR, so it is O(var-list prefix) — ~5us on the same query, ~0.3us to
 # reject a non-wrapper. Correctness here is worth ten lines, not 120x.
+def _sql_string(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _rewrite_show_variables(tree):
+    # Exasol has no SHOW VARIABLES, and sqlglot's Exasol generator emits nothing
+    # for it, so answer from _SYSVAR_VALUES -- the same table behind SELECT @@var,
+    # so the two spellings cannot drift apart. Column names are the ones MariaDB
+    # returns and clients look for, hence quoted and mixed case.
+    if not isinstance(tree, exp.Show) or tree.name != "VARIABLES":
+        return None
+    if tree.args.get("where") is not None:
+        # SHOW VARIABLES WHERE ... would need its predicate rewritten against
+        # these column names -- rare, so fall through to the normal path
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(value) + ")"
+        for name, value in sorted(_SYSVAR_VALUES.items()))
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Variable_name", "Value")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        # MariaDB matches variable names case-insensitively, Exasol LIKE does not
+        sql += ' WHERE UPPER("Variable_name") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
 _SET_STATEMENT_RE = re.compile(r"\s*SET\s+STATEMENT\s+", re.IGNORECASE)
 
 
@@ -230,6 +264,30 @@ def _select_limit_of(vars_text):
 _SET_OPERATION = getattr(exp, "SetOperation", exp.Union)
 
 
+def _is_zero_literal(node):
+    return isinstance(node, exp.Literal) and node.is_int and int(node.this) == 0
+
+
+def _order_by_offsets(tree):
+    # Exasol rejects OFFSET without ORDER BY. MariaDB allows it but guarantees
+    # no particular order, so ordering by the first column is a conformant
+    # reading -- and it is what a paging client wants, since without a stable
+    # order successive pages can repeat or skip rows. Costs a sort, so only do
+    # it where Exasol would otherwise refuse the query: an OFFSET of 0 changes
+    # nothing, so drop it outright rather than sort for it. MySQL clients paging
+    # from the start send `LIMIT 0, n`, which arrives in exactly that shape.
+    for node in tree.find_all(exp.Select, _SET_OPERATION):
+        offset = node.args.get("offset")
+        if offset is None or node.args.get("order") is not None:
+            continue
+        if _is_zero_literal(offset.expression):
+            node.set("offset", None)
+            continue
+        node.set("order", exp.Order(expressions=[
+            exp.Ordered(this=exp.Literal.number(1))]))
+    return tree
+
+
 def _transpile(request):
     request, select_limit = _strip_set_statement(request)
     tree = sqlglot.parse_one(request, read="mysql")
@@ -238,6 +296,9 @@ def _transpile(request):
     sysvars = _rewrite_session_var_select(tree)
     if sysvars is not None:
         return sysvars
+    showvars = _rewrite_show_variables(tree)
+    if showvars is not None:
+        return showvars
     tree = tree.transform(_rewrite_to_util)
     # An explicit LIMIT in the statement WINS over sql_select_limit in MariaDB,
     # even when it is larger (verified: sql_select_limit=3 with LIMIT 7 returns
@@ -249,6 +310,7 @@ def _transpile(request):
             and isinstance(tree, (exp.Select, _SET_OPERATION))
             and not tree.args.get("limit")):
         tree = tree.limit(select_limit)
+    tree = _order_by_offsets(tree)
     return tree.sql(dialect="exasol", identify=True)
 
 

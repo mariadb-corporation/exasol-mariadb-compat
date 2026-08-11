@@ -1,0 +1,1 @@
+SELECT `ID` FROM `json_test` ORDER BY `ID` DESC LIMIT 1, 2

@@ -7,7 +7,7 @@ from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "33b4b39-dirty"
+_PREPROCESSOR_BUILD = "a1c1608-dirty"
 
 
 def adapter_call(request):
@@ -22,6 +22,7 @@ _SYSVAR_VALUES = {
     "auto_increment_increment": "1",
     "system_time_zone": "UTC",
     "time_zone": "+00:00",
+    "lower_case_table_names": "2",
 }
 
 
@@ -45,6 +46,28 @@ def _rewrite_session_var_select(tree):
         else:
             cols.append("'" + val.replace("'", "''") + "'")
     return "SELECT " + ", ".join(cols)
+
+
+def _sql_string(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _rewrite_show_variables(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "VARIABLES":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(value) + ")"
+        for name, value in sorted(_SYSVAR_VALUES.items()))
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Variable_name", "Value")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' WHERE UPPER("Variable_name") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
 
 
 _SET_STATEMENT_RE = re.compile(r"\s*SET\s+STATEMENT\s+", re.IGNORECASE)
@@ -133,6 +156,23 @@ def _select_limit_of(vars_text):
 _SET_OPERATION = getattr(exp, "SetOperation", exp.Union)
 
 
+def _is_zero_literal(node):
+    return isinstance(node, exp.Literal) and node.is_int and int(node.this) == 0
+
+
+def _order_by_offsets(tree):
+    for node in tree.find_all(exp.Select, _SET_OPERATION):
+        offset = node.args.get("offset")
+        if offset is None or node.args.get("order") is not None:
+            continue
+        if _is_zero_literal(offset.expression):
+            node.set("offset", None)
+            continue
+        node.set("order", exp.Order(expressions=[
+            exp.Ordered(this=exp.Literal.number(1))]))
+    return tree
+
+
 def _transpile(request):
     request, select_limit = _strip_set_statement(request)
     tree = sqlglot.parse_one(request, read="mysql")
@@ -141,11 +181,15 @@ def _transpile(request):
     sysvars = _rewrite_session_var_select(tree)
     if sysvars is not None:
         return sysvars
+    showvars = _rewrite_show_variables(tree)
+    if showvars is not None:
+        return showvars
     tree = tree.transform(_rewrite_to_util)
     if (select_limit is not None
             and isinstance(tree, (exp.Select, _SET_OPERATION))
             and not tree.args.get("limit")):
         tree = tree.limit(select_limit)
+    tree = _order_by_offsets(tree)
     return tree.sql(dialect="exasol", identify=True)
 
 
