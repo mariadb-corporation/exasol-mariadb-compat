@@ -7,7 +7,7 @@ from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "0b68fc3-dirty"
+_PREPROCESSOR_BUILD = "2246a94-dirty"
 
 
 def adapter_call(request):
@@ -91,6 +91,49 @@ def _rewrite_show_processlist(tree):
     return ("SELECT " + cols
             + ' FROM "INFORMATION_SCHEMA"."PROCESSLIST"')
 
+
+
+_TABLE_STATUS_COLUMNS = (
+    ("TABLE_NAME", "Name"),
+    ("ENGINE", "Engine"),
+    ("VERSION", "Version"),
+    ("ROW_FORMAT", "Row_format"),
+    ("TABLE_ROWS", "Rows"),
+    ("AVG_ROW_LENGTH", "Avg_row_length"),
+    ("DATA_LENGTH", "Data_length"),
+    ("MAX_DATA_LENGTH", "Max_data_length"),
+    ("INDEX_LENGTH", "Index_length"),
+    ("DATA_FREE", "Data_free"),
+    ("AUTO_INCREMENT", "Auto_increment"),
+    ("CREATE_TIME", "Create_time"),
+    ("UPDATE_TIME", "Update_time"),
+    ("CHECK_TIME", "Check_time"),
+    ("TABLE_COLLATION", "Collation"),
+    ("CHECKSUM", "Checksum"),
+    ("CREATE_OPTIONS", "Create_options"),
+    ("TABLE_COMMENT", "Comment"),
+)
+
+
+def _rewrite_show_table_status(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "TABLE STATUS":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    cols = ", ".join('"' + src + '" AS "' + label + '"'
+                     for src, label in _TABLE_STATUS_COLUMNS)
+    db = tree.args.get("db")
+    schema = (_sql_string(db.name.upper()) if db is not None
+              else 'UPPER(CURRENT_SCHEMA)')
+    sql = ("SELECT " + cols
+           + ' FROM "INFORMATION_SCHEMA"."TABLES"'
+           + ' WHERE UPPER("TABLE_SCHEMA") = ' + schema)
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' AND UPPER("TABLE_NAME") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
 
 
 _SET_STATEMENT_RE = re.compile(r"\s*SET\s+STATEMENT\s+", re.IGNORECASE)
@@ -210,6 +253,9 @@ def _transpile(request):
     procs = _rewrite_show_processlist(tree)
     if procs is not None:
         return procs
+    status = _rewrite_show_table_status(tree)
+    if status is not None:
+        return status
     tree = tree.transform(_rewrite_to_util)
     if (select_limit is not None
             and isinstance(tree, (exp.Select, _SET_OPERATION))
