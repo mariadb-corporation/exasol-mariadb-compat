@@ -32,7 +32,7 @@ from sqlglot import expressions as exp
 # NB: production maria_preprocessor.sql keeps these same statements but with NO
 # comments — the documentation lives here in the debug variant only.
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "a1c1608-dirty"
+_PREPROCESSOR_BUILD = "0b68fc3-dirty"
 
 
 def adapter_call(request):
@@ -141,6 +141,34 @@ def _rewrite_show_variables(tree):
         # MariaDB matches variable names case-insensitively, Exasol LIKE does not
         sql += ' WHERE UPPER("Variable_name") LIKE UPPER(' + _sql_string(like.name) + ')'
     return sql
+
+
+_PROCESSLIST_COLUMNS = (
+    ("ID", "Id"),
+    ("USER", "User"),
+    ("HOST", "Host"),
+    ("DB", "db"),
+    ("COMMAND", "Command"),
+    ("TIME", "Time"),
+    ("STATE", "State"),
+    ("INFO", "Info"),
+    ("PROGRESS", "Progress"),
+)
+
+
+def _rewrite_show_processlist(tree):
+    # SHOW PROCESSLIST has no Exasol equivalent. Serve it from the
+    # INFORMATION_SCHEMA.PROCESSLIST view so both spellings agree, relabelling
+    # to the mixed-case names SHOW returns and clients match on. MariaDB
+    # truncates Info to 100 chars without FULL -- not reproduced, since Exasol
+    # gives us the current activity rather than query text anyway.
+    if not isinstance(tree, exp.Show) or tree.name != "PROCESSLIST":
+        return None
+    cols = ", ".join('"' + src + '" AS "' + label + '"'
+                     for src, label in _PROCESSLIST_COLUMNS)
+    return ("SELECT " + cols
+            + ' FROM "INFORMATION_SCHEMA"."PROCESSLIST"')
+
 
 
 _SET_STATEMENT_RE = re.compile(r"\s*SET\s+STATEMENT\s+", re.IGNORECASE)
@@ -299,6 +327,9 @@ def _transpile(request):
     showvars = _rewrite_show_variables(tree)
     if showvars is not None:
         return showvars
+    procs = _rewrite_show_processlist(tree)
+    if procs is not None:
+        return procs
     tree = tree.transform(_rewrite_to_util)
     # An explicit LIMIT in the statement WINS over sql_select_limit in MariaDB,
     # even when it is larger (verified: sql_select_limit=3 with LIMIT 7 returns

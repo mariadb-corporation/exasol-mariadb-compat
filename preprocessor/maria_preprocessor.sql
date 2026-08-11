@@ -7,7 +7,7 @@ from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "a1c1608-dirty"
+_PREPROCESSOR_BUILD = "0b68fc3-dirty"
 
 
 def adapter_call(request):
@@ -68,6 +68,29 @@ def _rewrite_show_variables(tree):
     if like is not None:
         sql += ' WHERE UPPER("Variable_name") LIKE UPPER(' + _sql_string(like.name) + ')'
     return sql
+
+
+_PROCESSLIST_COLUMNS = (
+    ("ID", "Id"),
+    ("USER", "User"),
+    ("HOST", "Host"),
+    ("DB", "db"),
+    ("COMMAND", "Command"),
+    ("TIME", "Time"),
+    ("STATE", "State"),
+    ("INFO", "Info"),
+    ("PROGRESS", "Progress"),
+)
+
+
+def _rewrite_show_processlist(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "PROCESSLIST":
+        return None
+    cols = ", ".join('"' + src + '" AS "' + label + '"'
+                     for src, label in _PROCESSLIST_COLUMNS)
+    return ("SELECT " + cols
+            + ' FROM "INFORMATION_SCHEMA"."PROCESSLIST"')
+
 
 
 _SET_STATEMENT_RE = re.compile(r"\s*SET\s+STATEMENT\s+", re.IGNORECASE)
@@ -184,6 +207,9 @@ def _transpile(request):
     showvars = _rewrite_show_variables(tree)
     if showvars is not None:
         return showvars
+    procs = _rewrite_show_processlist(tree)
+    if procs is not None:
+        return procs
     tree = tree.transform(_rewrite_to_util)
     if (select_limit is not None
             and isinstance(tree, (exp.Select, _SET_OPERATION))
