@@ -7,7 +7,7 @@ from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "f63b92b-dirty"
+_PREPROCESSOR_BUILD = "3e56e34-dirty"
 
 
 def adapter_call(request):
@@ -23,7 +23,20 @@ _SYSVAR_VALUES = {
     "system_time_zone": "UTC",
     "time_zone": "+00:00",
     "lower_case_table_names": "2",
+    "sql_mode": "STRICT_TRANS_TABLES",
 }
+
+_VERSION_VAR = "maria_preprocessor_version"
+
+
+def _sysvar_key(sp):
+    return sp.name.lstrip("@").lower()
+
+
+def _sysvar_value(key):
+    if key == _VERSION_VAR:
+        return _PREPROCESSOR_VERSION + "_" + _PREPROCESSOR_BUILD
+    return _SYSVAR_VALUES.get(key)
 
 
 def _rewrite_session_var_select(tree):
@@ -32,13 +45,9 @@ def _rewrite_session_var_select(tree):
     projs = tree.expressions
     if not projs or not all(isinstance(e, exp.SessionParameter) for e in projs):
         return None
-    if len(projs) == 1 and projs[0].sql(dialect="mysql").lstrip("@").lower() == "maria_preprocessor_version":
-        ver = _PREPROCESSOR_VERSION + "_" + _PREPROCESSOR_BUILD
-        return "SELECT '" + ver.replace("'", "''") + "'"
     cols = []
     for sp in projs:
-        key = sp.sql(dialect="mysql").lstrip("@").lower()
-        val = _SYSVAR_VALUES.get(key)
+        val = _sysvar_value(_sysvar_key(sp))
         if val is None:
             cols.append("NULL")
         elif val.isdigit():
@@ -368,6 +377,14 @@ def _transpile(request):
 
 
 def _rewrite_to_util(node):
+    if isinstance(node, exp.SessionParameter):
+        val = _sysvar_value(_sysvar_key(node))
+        if val is None:
+            return exp.Null()
+        if val.isdigit():
+            return exp.Literal.number(val)
+        return exp.Literal.string(val)
+
     if (isinstance(node, exp.Column)
             and node.table == ""
             and node.name
