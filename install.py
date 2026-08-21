@@ -6,6 +6,10 @@ single CREATE OR REPLACE.
 Idempotent — safe to re-run to update existing UDFs.
 
 Install: pip install pyexasol
+
+Example:
+
+    python install.py --host 127.0.0.1 --port 8563 --user sys --password exasol --no-ssl-verify
 """
 from __future__ import annotations
 
@@ -22,12 +26,16 @@ except ImportError:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--host", default="localhost")
+    p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", default="8563")
     p.add_argument("--user", default="sys")
     p.add_argument("--password", default="exasol")
-    p.add_argument("--no-ssl-verify", action="store_true",
-                   help="Skip Exasol TLS cert validation (for docker-db's self-signed cert)")
+    # Default off: docker-db ships a self-signed cert. --no-ssl-verify stays
+    # accepted as a no-op so existing commands keep working.
+    p.add_argument("--no-ssl-verify", action="store_true", default=True,
+                   help="Skip Exasol TLS cert validation (default; docker-db's self-signed cert)")
+    p.add_argument("--ssl-verify", dest="no_ssl_verify", action="store_false",
+                   help="Validate Exasol's TLS cert (default is to skip validation)")
     p.add_argument("--udfs-dir", type=Path, default=Path(__file__).parent / "udfs",
                    help="Root directory to scan for UDF *.sql files (default: ./udfs)")
     p.add_argument("--preprocessor-dir", type=Path,

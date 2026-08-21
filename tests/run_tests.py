@@ -524,8 +524,14 @@ def main() -> int:
     p.add_argument("--password", default=None,
                    help="Primary connection password. Default: exasol (Exasol direct), "
                         "or aBc123%%%% under --via-maxscale (MaxScale).")
-    p.add_argument("--no-ssl-verify", action="store_true",
-                   help="Skip Exasol TLS cert validation (for docker-db's self-signed cert)")
+    # Skipping validation is the default: every environment this suite runs
+    # against is a docker-db with a self-signed cert. --no-ssl-verify is kept as
+    # an accepted no-op so existing commands and docs keep working; pass
+    # --ssl-verify to opt back into validation.
+    p.add_argument("--no-ssl-verify", action="store_true", default=True,
+                   help="Skip Exasol TLS cert validation (default; kept for compatibility)")
+    p.add_argument("--ssl-verify", dest="no_ssl_verify", action="store_false",
+                   help="Validate Exasol's TLS cert (default is to skip validation)")
     p.add_argument("--via-maxscale", action="store_true",
                    help="Route the primary connection through MaxScale's Exasol router "
                         "(MariaDB wire protocol) instead of pyexasol-direct, exercising the "
@@ -558,8 +564,8 @@ def main() -> int:
                         "excludes pyexasol under --via-maxscale).")
     p.add_argument("--maxscale-host", default="127.0.0.1",
                    help="MaxScale host for non-pyexasol connectors (default: 127.0.0.1)")
-    p.add_argument("--maxscale-port", type=int, default=3309,
-                   help="MaxScale port for non-pyexasol connectors (default: 3309)")
+    p.add_argument("--maxscale-port", type=int, default=3311,
+                   help="MaxScale port for non-pyexasol connectors (default: 3311)")
     p.add_argument("--no-reload", action="store_true",
                    help="Skip the install-from-disk step. By default each run executes "
                         "dist/mariadb-compat.sql from this checkout into the DB before "

@@ -106,30 +106,32 @@ Each UDF has a directory under `tests/` with optional per-engine fixtures
 
 ```sh
 # Prereq: UTIL.* already installed (see Quick start)
+# Exasol TLS cert validation is skipped by default (docker-db ships a
+# self-signed cert); pass --ssl-verify to enforce it.
 pip install pyexasol
-python tests/run_tests.py --host 127.0.0.1 --user sys --password exasol --port 8563 --no-ssl-verify
+python tests/run_tests.py --host 127.0.0.1 --user sys --password exasol --port 8563
 
 # Only one UDF:
-python tests/run_tests.py --udf json_object --no-ssl-verify
+python tests/run_tests.py --udf json_object
 
 # Cross-check each case against MariaDB (auto-spawns mariadb:11.8 on :3306
 # if nothing's there; needs `pip install pymysql`):
-python tests/run_tests.py --compare-direct --no-ssl-verify
+python tests/run_tests.py --compare-direct
 
 # End-to-end check via an existing CDC pipe MariaDB → Exasol. Skips
 # setup.exasol.sql DDL/data (CDC owns it; only ALTER SESSION lines are kept
 # as session prelude), runs setup.mariadb.sql on MariaDB, and waits for CDC
 # to propagate before running each case on both engines:
-python tests/run_tests.py --compare-with-cdc --no-ssl-verify \
+python tests/run_tests.py --compare-with-cdc \
     --mariadb-user admin_user --mariadb-password 'aBc123%%'
 
-# Route test execution through MaxScale (port 3309 by default) using a
+# Route test execution through MaxScale (port 3311 by default) using a
 # specific MariaDB connector. Setup still uses pyexasol direct; only test
 # SQL goes via the chosen runner. See tests/connectors/README.md for the
 # JSON Lines protocol each runner implements and the available choices
 # (currently nodejs, python_pymysql, python_mariadb):
-python tests/run_tests.py --connector nodejs --no-ssl-verify \
-    --maxscale-host 127.0.0.1 --maxscale-port 3309 \
+python tests/run_tests.py --connector nodejs \
+    --maxscale-host 127.0.0.1 --maxscale-port 3311 \
     --mariadb-user admin_user --mariadb-password 'aBc123%%' \
     --udf set_names
 ```
@@ -141,7 +143,7 @@ bugs):
 ```sh
 echo '{"name":"q","sql":"SET NAMES utf8"}' | \
     node tests/connectors/nodejs/runner.js \
-         --host 127.0.0.1 --port 3309 --user admin_user --password 'aBc123%%'
+         --host 127.0.0.1 --port 3311 --user admin_user --password 'aBc123%%'
 ```
 
 The runner creates an ephemeral `MARIADB_COMPAT_TEST` schema, runs each
