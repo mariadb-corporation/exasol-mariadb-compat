@@ -1,2 +1,2 @@
-[["IS_TEST_PK", "PRIMARY KEY", "K1", 1],
- ["IS_TEST_PK", "PRIMARY KEY", "K2", 2]]
+[["is_test_pk", "PRIMARY KEY", "K1", 1],
+ ["is_test_pk", "PRIMARY KEY", "K2", 2]]

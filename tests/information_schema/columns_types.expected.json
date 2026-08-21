@@ -1,4 +1,4 @@
-[["ID", 1, "decimal", "decimal(18,0)", "YES"],
+[["ID", 1, "decimal", "decimal(10,0)", "YES"],
  ["NAME", 2, "varchar", "varchar(100)", "YES"],
  ["CODE", 3, "char", "char(3)", "YES"],
  ["AMOUNT", 4, "decimal", "decimal(10,2)", "YES"],

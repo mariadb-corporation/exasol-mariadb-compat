@@ -1,6 +1,6 @@
-DROP TABLE IF EXISTS json_test;
+DROP TABLE IF EXISTS "json_test";
 
-CREATE TABLE json_test (
+CREATE TABLE "json_test" (
     "ID"          INT,
     "JSON"        VARCHAR(2000000),
     "DESCRIPTION" VARCHAR(100),
