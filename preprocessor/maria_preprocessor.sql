@@ -7,7 +7,7 @@ from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "b34a65b"
+_PREPROCESSOR_BUILD = "773baaa-dirty"
 
 
 def adapter_call(request):
@@ -49,11 +49,13 @@ def _rewrite_session_var_select(tree):
     for sp in projs:
         val = _sysvar_value(_sysvar_key(sp))
         if val is None:
-            cols.append("NULL")
+            lit = "NULL"
         elif val.isdigit():
-            cols.append(val)
+            lit = val
         else:
-            cols.append("'" + val.replace("'", "''") + "'")
+            lit = "'" + val.replace("'", "''") + "'"
+        alias = sp.sql(dialect="mysql").replace('"', '""')
+        cols.append(lit + ' AS "' + alias + '"')
     return "SELECT " + ", ".join(cols)
 
 

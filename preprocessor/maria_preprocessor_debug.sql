@@ -32,7 +32,7 @@ from sqlglot import expressions as exp
 # NB: production maria_preprocessor.sql keeps these same statements but with NO
 # comments — the documentation lives here in the debug variant only.
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "b34a65b"
+_PREPROCESSOR_BUILD = "773baaa-dirty"
 
 
 def adapter_call(request):
@@ -89,11 +89,23 @@ def _rewrite_session_var_select(tree):
     for sp in projs:
         val = _sysvar_value(_sysvar_key(sp))
         if val is None:
-            cols.append("NULL")
+            lit = "NULL"
         elif val.isdigit():
-            cols.append(val)
+            lit = val
         else:
-            cols.append("'" + val.replace("'", "''") + "'")
+            lit = "'" + val.replace("'", "''") + "'"
+        # Alias back to the name MariaDB reports (@@SESSION.sql_mode, @@x, ...).
+        # sp.sql() re-renders the original spelling, including the caller's case
+        # for SESSION/GLOBAL. Without the alias Exasol names each column after
+        # the literal itself, so a client reading results BY NAME gets a header
+        # like 'STRICT_TRANS_TABLES' or 16777216 instead of the variable. Worse,
+        # a numeric-looking name reorders columns in drivers that hand back rows
+        # as name-keyed objects: ECMAScript enumerates integer-like keys first,
+        # so Object.values() on {"16777216":..., "'STRICT_TRANS_TABLES'":...}
+        # yields the values swapped. Positional readers (the C++/J handshake
+        # this function exists for) are unaffected either way.
+        alias = sp.sql(dialect="mysql").replace('"', '""')
+        cols.append(lit + ' AS "' + alias + '"')
     return "SELECT " + ", ".join(cols)
 
 
