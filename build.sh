@@ -12,7 +12,7 @@ OUT="dist/mariadb-compat.sql"
 VERSION="$(git describe --tags --always 2>/dev/null || echo 'dev')"
 # -dirty only when the bundle's own sources (udfs/, preprocessor/) have
 # uncommitted edits — unrelated working-tree changes don't taint the header.
-git diff --quiet HEAD -- udfs preprocessor 2>/dev/null || VERSION="${VERSION}-dirty"
+git diff --quiet HEAD -- udfs preprocessor views 2>/dev/null || VERSION="${VERSION}-dirty"
 
 # Build tag for the preprocessor stamp: the HEAD commit that the preprocessor
 # sources are at. -dirty only when preprocessor/ itself has uncommitted edits —
@@ -50,8 +50,25 @@ done
     echo "-- their Python comments so the bare-\`;\` form has a single statement"
     echo "-- terminator at the very end."
     echo
-    echo "CREATE SCHEMA IF NOT EXISTS UTIL;"
+    # Terminate each with a bare `;` line, not an inline one: that is the
+    # statement separator both exaplus and tests/run_tests.py's bundle splitter
+    # recognise, so consecutive statements don't merge into one execute().
+    echo "CREATE SCHEMA IF NOT EXISTS UTIL"
+    echo ";"
+    echo "CREATE SCHEMA IF NOT EXISTS INFORMATION_SCHEMA"
+    echo ";"
     echo
+
+    # information_schema compatibility views — plain DDL, so no --/ ... / block
+    # markers (those exist only to put exaplus into script-body mode for Python).
+    {
+        LC_ALL=C find views -name '*.sql' -print0 2>/dev/null | LC_ALL=C sort -z
+    } | while IFS= read -r -d '' f; do
+        echo "-- === ${f} ==="
+        cat "$f"
+        echo ";"
+        echo
+    done
 
     # UDFs first (referenced by the preprocessor), then preprocessor — sorted
     # bytewise (LC_ALL=C) so `maria_preprocessor.sql` (`.` < `_`) precedes

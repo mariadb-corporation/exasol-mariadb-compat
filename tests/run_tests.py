@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -54,6 +55,14 @@ try:
 except ImportError:
     sys.stderr.write("pyexasol is required: pip install pyexasol\n")
     sys.exit(3)
+
+
+_FAIL_BLOCK_START = "       ==== FAILED: "
+_FAIL_BLOCK_END = "       " + "=" * 72
+
+
+def _clip(s: str, limit: int = 500) -> str:
+    return s if len(s) <= limit else s[:limit] + "..."
 
 
 def _split_sql(text: str) -> list[str]:
@@ -339,6 +348,41 @@ def _exasol_session_prelude(setup_text: str) -> list[str]:
             if s.upper().startswith("ALTER SESSION")]
 
 
+def _failure_block(label, setup_exasol_text, setup_mariadb_text, sql_text,
+                   expected, exasol_out, mariadb_out=None) -> str:
+    """-vvv detail for one failing test. mariadb_out=None means MariaDB wasn't run."""
+    reason = ("Exasol execution error" if str(exasol_out).startswith("ERROR:")
+              else "Exasol result != expected")
+    block = [f"{_FAIL_BLOCK_START}{label} ({reason}) ===="]
+    if setup_exasol_text.strip():
+        block.append(f"       setup.exasol.sql:\n{setup_exasol_text.strip()}")
+    if setup_mariadb_text.strip():
+        block.append(f"       setup.mariadb.sql:\n{setup_mariadb_text.strip()}")
+    if setup_exasol_text.strip() or setup_mariadb_text.strip():
+        block.append("")
+    block.append(f"       sql     : {sql_text.strip()}")
+    block.append(f"       expected: {expected}")
+    block.append(f"       exasol  : {exasol_out}")
+    if mariadb_out is not None:
+        block.append(f"       mariadb : {mariadb_out}")
+    return "\n".join(block)
+
+
+def _setup_failure_block(label, setup_text, err) -> str:
+    """-vvv detail for a group-level setup failure (no test SQL/expected exist)."""
+    block = [f"{_FAIL_BLOCK_START}{label} (group setup error) ===="]
+    if setup_text.strip():
+        block.append(f"       setup:\n{setup_text.strip()}")
+        block.append("")
+    block.append(f"       error   : {err}")
+    return "\n".join(block)
+
+
+def _is_preprocessor_alter(stmt: str) -> bool:
+    return bool(re.match(r"ALTER\s+SESSION\s+SET\s+sql_preprocessor_script\b",
+                         stmt.strip(), re.IGNORECASE))
+
+
 def _cdc_probe(c, mc, schema: str, timeout: float = 5.0) -> None:
     """Validate the CDC pipe by creating a small PK'd table on MariaDB and
     waiting for it to appear in Exasol's catalog. Drops the probe afterward."""
@@ -469,8 +513,9 @@ def _run_many(args, connectors: list[str]) -> int:
     import subprocess
     base = [sys.executable, os.path.abspath(__file__)]
     passthrough = _argv_without_connector(sys.argv[1:])
-    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    env = {**os.environ, "PYTHONUNBUFFERED": "1", "RUN_TESTS_CHILD": "1"}
     rows = []
+    last_fail = None  # (connector, [blocks]) for the last connector with -vvv failures
     for i, conn in enumerate(connectors):
         argv = base + passthrough + ["--connector", conn]
         if i > 0 and not args.no_reload:
@@ -480,8 +525,18 @@ def _run_many(args, connectors: list[str]) -> int:
         note = ""
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, env=env)
+        block = None
+        conn_blocks = []
         for line in proc.stdout:
             sys.stdout.write(line)
+            if args.verbose >= 3:
+                if line.startswith(_FAIL_BLOCK_START):
+                    block = [line]
+                elif block is not None:
+                    block.append(line)
+                    if line.rstrip() == _FAIL_BLOCK_END:
+                        conn_blocks.append("".join(block))
+                        block = None
             m = re.search(r"(\d+)/(\d+) passed", line)
             if m:
                 passed, total = int(m.group(1)), int(m.group(2))
@@ -490,7 +545,13 @@ def _run_many(args, connectors: list[str]) -> int:
             elif re.search(r"\[setup\].*(failed|unreachable|not detected)", line):
                 note = line.split("]", 1)[1].strip() if "]" in line else line.strip()
         rc = proc.wait()
+        if conn_blocks:
+            last_fail = (conn, conn_blocks)
         rows.append((conn, rc, passed, total, note))
+
+    if last_fail is not None:
+        print(f"\n==== failures ({last_fail[0]}) ====")
+        sys.stdout.write("\n".join(last_fail[1]))
 
     print("\n==== summary ====")
     w = max(len(c) for c, *_ in rows)
@@ -524,8 +585,14 @@ def main() -> int:
     p.add_argument("--password", default=None,
                    help="Primary connection password. Default: exasol (Exasol direct), "
                         "or aBc123%%%% under --via-maxscale (MaxScale).")
-    p.add_argument("--no-ssl-verify", action="store_true",
-                   help="Skip Exasol TLS cert validation (for docker-db's self-signed cert)")
+    # Skipping validation is the default: every environment this suite runs
+    # against is a docker-db with a self-signed cert. --no-ssl-verify is kept as
+    # an accepted no-op so existing commands and docs keep working; pass
+    # --ssl-verify to opt back into validation.
+    p.add_argument("--no-ssl-verify", action="store_true", default=True,
+                   help="Skip Exasol TLS cert validation (default; kept for compatibility)")
+    p.add_argument("--ssl-verify", dest="no_ssl_verify", action="store_false",
+                   help="Validate Exasol's TLS cert (default is to skip validation)")
     p.add_argument("--via-maxscale", action="store_true",
                    help="Route the primary connection through MaxScale's Exasol router "
                         "(MariaDB wire protocol) instead of pyexasol-direct, exercising the "
@@ -558,8 +625,8 @@ def main() -> int:
                         "excludes pyexasol under --via-maxscale).")
     p.add_argument("--maxscale-host", default="127.0.0.1",
                    help="MaxScale host for non-pyexasol connectors (default: 127.0.0.1)")
-    p.add_argument("--maxscale-port", type=int, default=3309,
-                   help="MaxScale port for non-pyexasol connectors (default: 3309)")
+    p.add_argument("--maxscale-port", type=int, default=3311,
+                   help="MaxScale port for non-pyexasol connectors (default: 3311)")
     p.add_argument("--no-reload", action="store_true",
                    help="Skip the install-from-disk step. By default each run executes "
                         "dist/mariadb-compat.sql from this checkout into the DB before "
@@ -574,7 +641,9 @@ def main() -> int:
     p.add_argument("--udf", action="append", default=None,
                    help="Run only these UDF groups (repeatable; default: all)")
     p.add_argument("-v", "--verbose", action="count", default=0,
-                   help="Print SQL and result rows for each test (-vv also prints setup SQL)")
+                   help="Print SQL and result rows for each test (-vv also prints setup SQL; "
+                        "-vvv also prints setup, SQL, expected and both engines' outputs "
+                        "for each failing test)")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--compare-direct", action="store_true",
                       help="Run each test SQL directly against MariaDB (using setup.mariadb.sql) and "
@@ -892,6 +961,7 @@ def main() -> int:
 
     setup_filenames = {"setup.exasol.sql", "setup.mariadb.sql"}
     passed = failed = 0
+    fail_blocks = []
     for udf_dir in udf_dirs:
         # Always start each group with the preprocessor OFF so setup SQL is
         # parsed as Exasol-native. Groups that exercise the preprocessor
@@ -902,13 +972,20 @@ def main() -> int:
             pass
 
         setup_exasol = udf_dir / "setup.exasol.sql"
+        setup_exasol_text = setup_exasol.read_text() if setup_exasol.exists() else ""
+        setup_mariadb_text = ""
         if setup_exasol.exists():
             # In CDC mode we keep only ALTER SESSION lines (e.g. enabling
             # UTIL.MARIA_PREPROCESSOR for the maria_preprocessor group);
             # tables and rows arrive on Exasol via CDC.
-            stmts = (_exasol_session_prelude(setup_exasol.read_text())
+            stmts = (_exasol_session_prelude(setup_exasol_text)
                      if compare_mode == "cdc"
-                     else _split_sql(setup_exasol.read_text()))
+                     else _split_sql(setup_exasol_text))
+            if args.via_maxscale:
+                # MaxScale's exasolrouter is the transpiler there; enabling the
+                # Exasol-side preprocessor on the control session is meaningless.
+                stmts = [st for st in stmts if not _is_preprocessor_alter(st)]
+                setup_exasol_text = "\n".join(f"{st};" for st in stmts)
             try:
                 for stmt in stmts:
                     if args.verbose >= 2:
@@ -917,11 +994,18 @@ def main() -> int:
             except Exception as e:
                 print(f"[FAIL] {udf_dir.name}/setup.exasol: {e}", file=sys.stderr)
                 failed += 1
+                if args.verbose >= 3:
+                    text = _setup_failure_block(f"{udf_dir.name}/setup.exasol",
+                                                setup_exasol_text, e)
+                    print("\n" + text)
+                    print(_FAIL_BLOCK_END)
+                    fail_blocks.append(text + "\n" + _FAIL_BLOCK_END + "\n")
                 continue
 
         setup_mariadb = udf_dir / "setup.mariadb.sql"
         if mc is not None and setup_mariadb.exists():
             setup_text = setup_mariadb.read_text()
+            setup_mariadb_text = setup_text
             try:
                 for stmt in _split_sql(setup_text):
                     if args.verbose >= 2:
@@ -931,6 +1015,12 @@ def main() -> int:
             except Exception as e:
                 print(f"[FAIL] {udf_dir.name}/setup.mariadb: {e}", file=sys.stderr)
                 failed += 1
+                if args.verbose >= 3:
+                    text = _setup_failure_block(f"{udf_dir.name}/setup.mariadb",
+                                                setup_text, e)
+                    print("\n" + text)
+                    print(_FAIL_BLOCK_END)
+                    fail_blocks.append(text + "\n" + _FAIL_BLOCK_END + "\n")
                 continue
             if compare_mode == "cdc":
                 tables = _parse_create_tables(setup_text)
@@ -943,6 +1033,12 @@ def main() -> int:
                 except Exception as e:
                     print(f"[FAIL] {udf_dir.name}/cdc-wait: {e}", file=sys.stderr)
                     failed += 1
+                    if args.verbose >= 3:
+                        text = _setup_failure_block(f"{udf_dir.name}/cdc-wait",
+                                                    setup_text, e)
+                        print("\n" + text)
+                        print(_FAIL_BLOCK_END)
+                        fail_blocks.append(text + "\n" + _FAIL_BLOCK_END + "\n")
                     continue
 
         cases = sorted(f for f in udf_dir.glob("*.sql") if f.name not in setup_filenames)
@@ -957,35 +1053,63 @@ def main() -> int:
             if args.verbose:
                 print(f"[run]  {label}")
                 print(f"       sql     : {sql_text.strip()}")
+            expected = "<not loaded>"
             try:
                 rows = runner.execute(label, sql_text)
                 expected = json.loads(expected_file.read_text())
             except Exception as e:
                 print(f"[FAIL] {label}: {e}", file=sys.stderr)
                 failed += 1
+                if args.verbose >= 3:
+                    text = _failure_block(label, setup_exasol_text, setup_mariadb_text,
+                                          sql_text, expected, f"ERROR: {e}")
+                    print("\n" + text)
+                    print(_FAIL_BLOCK_END)
+                    fail_blocks.append(text + "\n" + _FAIL_BLOCK_END + "\n")
                 continue
 
+            had_error = False
             if [[str(x) for x in r] for r in rows] == [[str(x) for x in r] for r in expected]:
                 print(f"[ok]   {label}")
                 if args.verbose:
                     print(f"       exasol  : {rows}")
                 passed += 1
             else:
+                had_error = True
                 print(f"[FAIL] {label}", file=sys.stderr)
                 print(f"       expected: {expected}", file=sys.stderr)
                 print(f"       exasol  : {rows}", file=sys.stderr)
                 failed += 1
 
+            mrows = None
+            merr = None
             if mc is not None:
                 try:
                     with mc.cursor() as mcur:
                         mcur.execute(sql_text)
                         mrows = [list(r) for r in (mcur.fetchall() or ())]
-                    diff = "" if ([[str(x) for x in r] for r in mrows]
-                                  == [[str(x) for x in r] for r in rows]) else " (DIFF)"
-                    print(f"       mariadb : {mrows}{diff}")
+                    differs = ([[str(x) for x in r] for r in mrows]
+                               != [[str(x) for x in r] for r in rows])
+                    # Matching output is only shown with -v; on a mismatch both
+                    # engines' rows are shown, clipped to 500 characters.
+                    if differs:
+                        print(f"       exasol  : {_clip(str(rows))}")
+                        print(f"       mariadb : {_clip(str(mrows))} (DIFF)")
+                    elif args.verbose:
+                        print(f"       mariadb : {mrows}")
                 except Exception as e:
+                    merr = e
                     print(f"       mariadb : ERROR: {e}")
+
+            # Only tests that [FAIL]ed (Exasol != expected) get a block; an
+            # [ok] test with a MariaDB DIFF/ERROR is not recapped.
+            if args.verbose >= 3 and had_error:
+                text = _failure_block(
+                    label, setup_exasol_text, setup_mariadb_text, sql_text, expected, rows,
+                    None if mc is None else ('ERROR: ' + str(merr) if merr else mrows))
+                print("\n" + text)
+                print(_FAIL_BLOCK_END)
+                fail_blocks.append(text + "\n" + _FAIL_BLOCK_END + "\n")
 
     runner.close()
 
@@ -1013,6 +1137,10 @@ def main() -> int:
         _stop_mariadb_container()
 
     total = passed + failed
+    # Under _run_many the parent does the reprint (for the last failing connector).
+    if fail_blocks and not os.environ.get("RUN_TESTS_CHILD"):
+        print("\n==== failures ====")
+        sys.stdout.write("\n".join(fail_blocks))
     print(f"\n{passed}/{total} passed" + (f", {failed} failed" if failed else ""))
     return 0 if failed == 0 else 1
 

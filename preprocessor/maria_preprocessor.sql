@@ -1,12 +1,13 @@
 CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT UTIL.MARIA_PREPROCESSOR AS
 
 import json
+import re
 import sqlglot
 from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "7c6d449-dirty"
+_PREPROCESSOR_BUILD = "773baaa-dirty"
 
 
 def adapter_call(request):
@@ -21,7 +22,21 @@ _SYSVAR_VALUES = {
     "auto_increment_increment": "1",
     "system_time_zone": "UTC",
     "time_zone": "+00:00",
+    "lower_case_table_names": "2",
+    "sql_mode": "STRICT_TRANS_TABLES",
 }
+
+_VERSION_VAR = "maria_preprocessor_version"
+
+
+def _sysvar_key(sp):
+    return sp.name.lstrip("@").lower()
+
+
+def _sysvar_value(key):
+    if key == _VERSION_VAR:
+        return _PREPROCESSOR_VERSION + "_" + _PREPROCESSOR_BUILD
+    return _SYSVAR_VALUES.get(key)
 
 
 def _rewrite_session_var_select(tree):
@@ -30,34 +45,348 @@ def _rewrite_session_var_select(tree):
     projs = tree.expressions
     if not projs or not all(isinstance(e, exp.SessionParameter) for e in projs):
         return None
-    if len(projs) == 1 and projs[0].sql(dialect="mysql").lstrip("@").lower() == "maria_preprocessor_version":
-        ver = _PREPROCESSOR_VERSION + "_" + _PREPROCESSOR_BUILD
-        return "SELECT '" + ver.replace("'", "''") + "'"
     cols = []
     for sp in projs:
-        key = sp.sql(dialect="mysql").lstrip("@").lower()
-        val = _SYSVAR_VALUES.get(key)
+        val = _sysvar_value(_sysvar_key(sp))
         if val is None:
-            cols.append("NULL")
+            lit = "NULL"
         elif val.isdigit():
-            cols.append(val)
+            lit = val
         else:
-            cols.append("'" + val.replace("'", "''") + "'")
+            lit = "'" + val.replace("'", "''") + "'"
+        alias = sp.sql(dialect="mysql").replace('"', '""')
+        cols.append(lit + ' AS "' + alias + '"')
     return "SELECT " + ", ".join(cols)
 
 
+def _sql_string(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _rewrite_show_variables(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "VARIABLES":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(value) + ")"
+        for name, value in sorted(_SYSVAR_VALUES.items()))
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Variable_name", "Value")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' WHERE UPPER("Variable_name") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+_CHARSETS = (
+    ("ascii", "US ASCII", "ascii_general_ci", 1),
+    ("utf8mb4", "UTF-8 Unicode", "utf8mb4_general_ci", 4),
+)
+
+
+def _rewrite_show_charset(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "CHARACTER SET":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(desc) + ", "
+        + _sql_string(collation) + ", " + str(maxlen) + ")"
+        for name, desc, collation, maxlen in _CHARSETS)
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Charset", "Description", "Default collation", "Maxlen")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' WHERE UPPER("Charset") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+def _rewrite_show_create_table(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "CREATE TABLE":
+        return None
+    target = tree.args.get("target")
+    if target is None:
+        return None
+    db = tree.args.get("db")
+    schema = (' AND UPPER("TABLE_SCHEMA") = ' + _sql_string(db.name.upper())
+              if db is not None
+              else ' AND UPPER("TABLE_SCHEMA") = UPPER(CURRENT_SCHEMA)')
+    return ('SELECT "TABLE_NAME" AS "Table", "DDL" AS "Create Table"'
+            + ' FROM "UTIL"."SHOW_CREATE_TABLE"'
+            + ' WHERE UPPER("TABLE_NAME") = ' + _sql_string(target.name.upper())
+            + schema)
+
+
+def _rewrite_show_engines(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "ENGINES":
+        return None
+    return ("SELECT * FROM (VALUES ("
+            + _sql_string("EXASOL") + ", " + _sql_string("DEFAULT") + ", "
+            + _sql_string("Exasol analytic database") + ", "
+            + _sql_string("YES") + ", " + _sql_string("NO") + ", "
+            + _sql_string("NO") + ")) AS t("
+            + '"Engine", "Support", "Comment", "Transactions", "XA", "Savepoints")')
+
+
+def _rewrite_show_plugins(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "PLUGINS":
+        return None
+    return ("SELECT * FROM (VALUES ("
+            + _sql_string("EXASOL") + ", " + _sql_string("ACTIVE") + ", "
+            + _sql_string("STORAGE ENGINE") + ", CAST(NULL AS VARCHAR(64)), "
+            + _sql_string("PROPRIETARY") + ")) AS t("
+            + '"Name", "Status", "Type", "Library", "License")')
+
+
+_COLLATIONS = (
+    ("ascii_general_ci", "ascii", 11, "Yes"),
+    ("utf8mb4_general_ci", "utf8mb4", 45, "Yes"),
+)
+
+
+def _rewrite_show_collation(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "COLLATION":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(charset) + ", "
+        + str(ident) + ", " + _sql_string(default) + ", 'Yes', 1)"
+        for name, charset, ident, default in _COLLATIONS)
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Collation", "Charset", "Id", "Default", "Compiled", "Sortlen")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' WHERE UPPER("Collation") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+_PROCESSLIST_COLUMNS = (
+    ("ID", "Id"),
+    ("USER", "User"),
+    ("HOST", "Host"),
+    ("DB", "db"),
+    ("COMMAND", "Command"),
+    ("TIME", "Time"),
+    ("STATE", "State"),
+    ("INFO", "Info"),
+    ("PROGRESS", "Progress"),
+)
+
+
+def _rewrite_show_processlist(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "PROCESSLIST":
+        return None
+    cols = ", ".join('"' + src + '" AS "' + label + '"'
+                     for src, label in _PROCESSLIST_COLUMNS)
+    return ("SELECT " + cols
+            + ' FROM "INFORMATION_SCHEMA"."PROCESSLIST"')
+
+
+
+_TABLE_STATUS_COLUMNS = (
+    ("TABLE_NAME", "Name"),
+    ("ENGINE", "Engine"),
+    ("VERSION", "Version"),
+    ("ROW_FORMAT", "Row_format"),
+    ("TABLE_ROWS", "Rows"),
+    ("AVG_ROW_LENGTH", "Avg_row_length"),
+    ("DATA_LENGTH", "Data_length"),
+    ("MAX_DATA_LENGTH", "Max_data_length"),
+    ("INDEX_LENGTH", "Index_length"),
+    ("DATA_FREE", "Data_free"),
+    ("AUTO_INCREMENT", "Auto_increment"),
+    ("CREATE_TIME", "Create_time"),
+    ("UPDATE_TIME", "Update_time"),
+    ("CHECK_TIME", "Check_time"),
+    ("TABLE_COLLATION", "Collation"),
+    ("CHECKSUM", "Checksum"),
+    ("CREATE_OPTIONS", "Create_options"),
+    ("TABLE_COMMENT", "Comment"),
+)
+
+
+def _rewrite_show_table_status(tree):
+    if not isinstance(tree, exp.Show) or tree.name != "TABLE STATUS":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    cols = ", ".join('"' + src + '" AS "' + label + '"'
+                     for src, label in _TABLE_STATUS_COLUMNS)
+    db = tree.args.get("db")
+    schema = (_sql_string(db.name.upper()) if db is not None
+              else 'UPPER(CURRENT_SCHEMA)')
+    sql = ("SELECT " + cols
+           + ' FROM "INFORMATION_SCHEMA"."TABLES"'
+           + ' WHERE UPPER("TABLE_SCHEMA") = ' + schema)
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' AND UPPER("TABLE_NAME") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+_SET_STATEMENT_RE = re.compile(r"\s*SET\s+STATEMENT\s+", re.IGNORECASE)
+
+
+def _skip_ws_comments(sql, i):
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+        elif ch == "#" or sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            break
+    return i
+
+
+_SQL_SELECT_LIMIT_RE = re.compile(
+    r"(?:^|,)\s*(?:@@)?(?:(?:session|local)\.)?sql_select_limit\s*=\s*(\d+)",
+    re.IGNORECASE)
+
+
+def _strip_set_statement(sql):
+    m = _SET_STATEMENT_RE.match(sql, _skip_ws_comments(sql, 0))
+    if not m:
+        return sql, None
+    i = m.end()
+    n = len(sql)
+    depth = 0
+    quote = ""
+    delim = True
+    seen = []
+    while i < n:
+        ch = sql[i]
+        if quote:
+            if ch == "\\" and quote != "`":
+                i += 1
+            elif ch == quote:
+                if i + 1 < n and sql[i + 1] == quote:
+                    i += 1          # doubled quote -> escaped, stay in string
+                else:
+                    quote = ""
+            i += 1
+            continue
+        j = _skip_ws_comments(sql, i)
+        if j > i:
+            i = j
+            delim = True
+            seen.append(" ")
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            seen.append(" ")
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch in ",=":
+            delim = True
+            seen.append(ch)
+            i += 1
+            continue
+        elif depth == 0 and delim and sql[i:i + 3].upper() == "FOR":
+            after = sql[i + 3:i + 4]
+            if not (after.isalnum() or after == "_"):
+                return sql[i + 3:].lstrip(), _select_limit_of("".join(seen))
+        else:
+            seen.append(ch)
+        delim = False
+        i += 1
+    return sql, None
+
+
+def _select_limit_of(vars_text):
+    m = None
+    for m in _SQL_SELECT_LIMIT_RE.finditer(vars_text):
+        pass
+    return int(m.group(1)) if m else None
+
+
+_SET_OPERATION = getattr(exp, "SetOperation", exp.Union)
+
+
+def _is_zero_literal(node):
+    return isinstance(node, exp.Literal) and node.is_int and int(node.this) == 0
+
+
+def _order_by_offsets(tree):
+    for node in tree.find_all(exp.Select, _SET_OPERATION):
+        offset = node.args.get("offset")
+        if offset is None or node.args.get("order") is not None:
+            continue
+        if _is_zero_literal(offset.expression):
+            node.set("offset", None)
+            continue
+        node.set("order", exp.Order(expressions=[
+            exp.Ordered(this=exp.Literal.number(1))]))
+    return tree
+
+
 def _transpile(request):
+    request, select_limit = _strip_set_statement(request)
     tree = sqlglot.parse_one(request, read="mysql")
     if tree is None:
         return request
     sysvars = _rewrite_session_var_select(tree)
     if sysvars is not None:
         return sysvars
+    showvars = _rewrite_show_variables(tree)
+    if showvars is not None:
+        return showvars
+    charset = _rewrite_show_charset(tree)
+    if charset is not None:
+        return charset
+    collation = _rewrite_show_collation(tree)
+    if collation is not None:
+        return collation
+    create_table = _rewrite_show_create_table(tree)
+    if create_table is not None:
+        return create_table
+    engines = _rewrite_show_engines(tree)
+    if engines is not None:
+        return engines
+    plugins = _rewrite_show_plugins(tree)
+    if plugins is not None:
+        return plugins
+    procs = _rewrite_show_processlist(tree)
+    if procs is not None:
+        return procs
+    status = _rewrite_show_table_status(tree)
+    if status is not None:
+        return status
     tree = tree.transform(_rewrite_to_util)
+    if (select_limit is not None
+            and isinstance(tree, (exp.Select, _SET_OPERATION))
+            and not tree.args.get("limit")):
+        tree = tree.limit(select_limit)
+    tree = _order_by_offsets(tree)
     return tree.sql(dialect="exasol", identify=True)
 
 
 def _rewrite_to_util(node):
+    if isinstance(node, exp.SessionParameter):
+        val = _sysvar_value(_sysvar_key(node))
+        if val is None:
+            return exp.Null()
+        if val.isdigit():
+            return exp.Literal.number(val)
+        return exp.Literal.string(val)
+
     if (isinstance(node, exp.Column)
             and node.table == ""
             and node.name

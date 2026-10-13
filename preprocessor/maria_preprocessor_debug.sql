@@ -15,6 +15,7 @@ CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT UTIL.MARIA_PREPROCESSOR_DEBUG AS
 # adapter_call differs. If you change rules in one, change them in the other.
 
 import json
+import re
 import sqlglot
 from sqlglot import expressions as exp
 
@@ -31,7 +32,7 @@ from sqlglot import expressions as exp
 # NB: production maria_preprocessor.sql keeps these same statements but with NO
 # comments — the documentation lives here in the debug variant only.
 _PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "7c6d449-dirty"
+_PREPROCESSOR_BUILD = "773baaa-dirty"
 
 
 def adapter_call(request):
@@ -43,7 +44,31 @@ _SYSVAR_VALUES = {
     "auto_increment_increment": "1",
     "system_time_zone": "UTC",
     "time_zone": "+00:00",
+    # 2 = names stored as written, compared case-insensitively, which is what
+    # Exasol does under SQL_IDENTIFIER_COMPARISON = 'IGNORE CASE'. Reporting 0
+    # would tell clients identifiers are case-sensitive, making them quote names
+    # in whatever case they guessed.
+    "lower_case_table_names": "2",
+    # Exasol rejects bad values rather than truncating them, so strict mode is
+    # the honest claim. Deliberately not ANSI_QUOTES: statements are parsed as
+    # MySQL here, where "x" is a string literal, not an identifier.
+    "sql_mode": "STRICT_TRANS_TABLES",
 }
+
+
+_VERSION_VAR = "maria_preprocessor_version"
+
+
+def _sysvar_key(sp):
+    # the variable NAME, so @@x, @@SESSION.x and @@GLOBAL.x all resolve to x --
+    # rendering the node instead yields 'session.x' and matches nothing
+    return sp.name.lstrip("@").lower()
+
+
+def _sysvar_value(key):
+    if key == _VERSION_VAR:
+        return _PREPROCESSOR_VERSION + "_" + _PREPROCESSOR_BUILD
+    return _SYSVAR_VALUES.get(key)
 
 
 def _rewrite_session_var_select(tree):
@@ -60,34 +85,481 @@ def _rewrite_session_var_select(tree):
         return None
     # `SELECT @@maria_preprocessor_version` -> the canned version string. Lets
     # any client read which preprocessor build is live, independent of sqlglot.
-    if len(projs) == 1 and projs[0].sql(dialect="mysql").lstrip("@").lower() == "maria_preprocessor_version":
-        ver = _PREPROCESSOR_VERSION + "_" + _PREPROCESSOR_BUILD
-        return "SELECT '" + ver.replace("'", "''") + "'"
     cols = []
     for sp in projs:
-        key = sp.sql(dialect="mysql").lstrip("@").lower()
-        val = _SYSVAR_VALUES.get(key)
+        val = _sysvar_value(_sysvar_key(sp))
         if val is None:
-            cols.append("NULL")
+            lit = "NULL"
         elif val.isdigit():
-            cols.append(val)
+            lit = val
         else:
-            cols.append("'" + val.replace("'", "''") + "'")
+            lit = "'" + val.replace("'", "''") + "'"
+        # Alias back to the name MariaDB reports (@@SESSION.sql_mode, @@x, ...).
+        # sp.sql() re-renders the original spelling, including the caller's case
+        # for SESSION/GLOBAL. Without the alias Exasol names each column after
+        # the literal itself, so a client reading results BY NAME gets a header
+        # like 'STRICT_TRANS_TABLES' or 16777216 instead of the variable. Worse,
+        # a numeric-looking name reorders columns in drivers that hand back rows
+        # as name-keyed objects: ECMAScript enumerates integer-like keys first,
+        # so Object.values() on {"16777216":..., "'STRICT_TRANS_TABLES'":...}
+        # yields the values swapped. Positional readers (the C++/J handshake
+        # this function exists for) are unaffected either way.
+        alias = sp.sql(dialect="mysql").replace('"', '""')
+        cols.append(lit + ' AS "' + alias + '"')
     return "SELECT " + ", ".join(cols)
 
 
+# DbVisualizer (and other MariaDB clients) prepend a per-statement hint
+# wrapper: `SET STATEMENT SQL_SELECT_LIMIT=20000 FOR SELECT ...`. sqlglot has
+# no parse rule for the form, so parse_one degrades the WHOLE statement to a
+# generic exp.Command and it reaches Exasol verbatim — which rejects it with
+# "syntax error, unexpected STATEMENT_". Note the exp.Set no-op branch in
+# _rewrite_to_util does NOT catch this: that fires on exp.Set, this is Command.
+#
+# Exasol has no session-hint equivalent, so the variables are dropped outright
+# and only <stmt> is transpiled. Notably SQL_SELECT_LIMIT is discarded rather
+# than translated into a LIMIT: injecting one would change result semantics for
+# statements that already carry a LIMIT/FETCH FIRST, and the client still stops
+# reading at its own row cap. The cost is that Exasol computes the full result
+# set rather than stopping early.
+#
+# The scan can't be a plain regex up to /FOR/ because the var list may contain
+# string literals ("SET STATEMENT x='a FOR b' FOR SELECT ..."), so track quote
+# state ('/"/backtick, with doubled- and backslash-escapes) and paren depth and
+# split on the first FOR keyword at depth 0 outside any quote.
+#
+# It also has to understand comments, in BOTH positions: JDBC tooling routinely
+# prepends "/* app */" before the statement (which defeats an anchored ^\s*SET
+# match, so the wrapper survives and Exasol rejects it exactly as before the
+# fix), and a comment inside the var list would otherwise be scanned as if it
+# were SQL — "SET STATEMENT a=1 /* FOR */ FOR ..." split on the commented-out
+# FOR and produced the garbage "*/ FOR SELECT 1".
+#
+# We deliberately do NOT use sqlglot.tokenize() here, even though it handles all
+# of this correctly. Measured on the deployed 30.11.0: tokenizing a 20-line
+# DbVisualizer query costs ~600us against a ~895us parse+generate budget (+67%
+# latency), because it lexes the whole statement. This scanner stops at the
+# first FOR, so it is O(var-list prefix) — ~5us on the same query, ~0.3us to
+# reject a non-wrapper. Correctness here is worth ten lines, not 120x.
+def _sql_string(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _rewrite_show_variables(tree):
+    # Exasol has no SHOW VARIABLES, and sqlglot's Exasol generator emits nothing
+    # for it, so answer from _SYSVAR_VALUES -- the same table behind SELECT @@var,
+    # so the two spellings cannot drift apart. Column names are the ones MariaDB
+    # returns and clients look for, hence quoted and mixed case.
+    if not isinstance(tree, exp.Show) or tree.name != "VARIABLES":
+        return None
+    if tree.args.get("where") is not None:
+        # SHOW VARIABLES WHERE ... would need its predicate rewritten against
+        # these column names -- rare, so fall through to the normal path
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(value) + ")"
+        for name, value in sorted(_SYSVAR_VALUES.items()))
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Variable_name", "Value")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        # MariaDB matches variable names case-insensitively, Exasol LIKE does not
+        sql += ' WHERE UPPER("Variable_name") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+_CHARSETS = (
+    ("ascii", "US ASCII", "ascii_general_ci", 1),
+    ("utf8mb4", "UTF-8 Unicode", "utf8mb4_general_ci", 4),
+)
+
+
+def _rewrite_show_charset(tree):
+    # Exasol columns are either ASCII or UTF8, so those two are the whole truth
+    # here -- reporting MariaDB's full list of 40 charsets would offer clients
+    # (and their CREATE TABLE dropdowns) encodings Exasol cannot store. The
+    # default collation matches what the information_schema views claim.
+    if not isinstance(tree, exp.Show) or tree.name != "CHARACTER SET":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(desc) + ", "
+        + _sql_string(collation) + ", " + str(maxlen) + ")"
+        for name, desc, collation, maxlen in _CHARSETS)
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Charset", "Description", "Default collation", "Maxlen")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' WHERE UPPER("Charset") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+def _rewrite_show_create_table(tree):
+    # The DDL is assembled by the UTIL.SHOW_CREATE_TABLE view -- Exasol keeps no
+    # statement text, so it is reconstructed from the catalog and describes what
+    # Exasol has rather than what originally created the table. Name matching is
+    # case-insensitive, as Exasol resolves identifiers under IGNORE CASE.
+    if not isinstance(tree, exp.Show) or tree.name != "CREATE TABLE":
+        return None
+    target = tree.args.get("target")
+    if target is None:
+        return None
+    db = tree.args.get("db")
+    schema = (' AND UPPER("TABLE_SCHEMA") = ' + _sql_string(db.name.upper())
+              if db is not None
+              else ' AND UPPER("TABLE_SCHEMA") = UPPER(CURRENT_SCHEMA)')
+    return ('SELECT "TABLE_NAME" AS "Table", "DDL" AS "Create Table"'
+            + ' FROM "UTIL"."SHOW_CREATE_TABLE"'
+            + ' WHERE UPPER("TABLE_NAME") = ' + _sql_string(target.name.upper())
+            + schema)
+
+
+def _rewrite_show_engines(tree):
+    # Exasol is the only engine, and it is the one information_schema.TABLES and
+    # SHOW TABLE STATUS already report. Listing InnoDB would make engine pickers
+    # look normal at the cost of inviting ENGINE=InnoDB in CREATE TABLE and
+    # promising XA and savepoints, neither of which Exasol has.
+    if not isinstance(tree, exp.Show) or tree.name != "ENGINES":
+        return None
+    return ("SELECT * FROM (VALUES ("
+            + _sql_string("EXASOL") + ", " + _sql_string("DEFAULT") + ", "
+            + _sql_string("Exasol analytic database") + ", "
+            + _sql_string("YES") + ", " + _sql_string("NO") + ", "
+            + _sql_string("NO") + ")) AS t("
+            + '"Engine", "Support", "Comment", "Transactions", "XA", "Savepoints")')
+
+
+def _rewrite_show_plugins(tree):
+    # MariaDB counts storage engines among its plugins, so report the one engine
+    # SHOW ENGINES names and nothing else -- Exasol has no plugin architecture,
+    # and no auth or daemon plugin a client might look for exists here.
+    if not isinstance(tree, exp.Show) or tree.name != "PLUGINS":
+        return None
+    return ("SELECT * FROM (VALUES ("
+            + _sql_string("EXASOL") + ", " + _sql_string("ACTIVE") + ", "
+            + _sql_string("STORAGE ENGINE") + ", CAST(NULL AS VARCHAR(64)), "
+            + _sql_string("PROPRIETARY") + ")) AS t("
+            + '"Name", "Status", "Type", "Library", "License")')
+
+
+_COLLATIONS = (
+    ("ascii_general_ci", "ascii", 11, "Yes"),
+    ("utf8mb4_general_ci", "utf8mb4", 45, "Yes"),
+)
+
+
+def _rewrite_show_collation(tree):
+    # One collation per charset SHOW CHARSET reports, and no others -- a
+    # collation naming a charset that list omits is a dangling reference to any
+    # client that cross-checks them. Exasol has no binary string type to
+    # collate, so MariaDB's binary collation has no counterpart here. Exasol has no
+    # collation catalog -- ordering follows the database-wide setting -- so
+    # these name what the information_schema views already claim rather than
+    # describing anything selectable. Compiled and Sortlen are constant.
+    if not isinstance(tree, exp.Show) or tree.name != "COLLATION":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    rows = ", ".join(
+        "(" + _sql_string(name) + ", " + _sql_string(charset) + ", "
+        + str(ident) + ", " + _sql_string(default) + ", 'Yes', 1)"
+        for name, charset, ident, default in _COLLATIONS)
+    sql = ('SELECT * FROM (VALUES ' + rows
+           + ') AS t("Collation", "Charset", "Id", "Default", "Compiled", "Sortlen")')
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' WHERE UPPER("Collation") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+_PROCESSLIST_COLUMNS = (
+    ("ID", "Id"),
+    ("USER", "User"),
+    ("HOST", "Host"),
+    ("DB", "db"),
+    ("COMMAND", "Command"),
+    ("TIME", "Time"),
+    ("STATE", "State"),
+    ("INFO", "Info"),
+    ("PROGRESS", "Progress"),
+)
+
+
+def _rewrite_show_processlist(tree):
+    # SHOW PROCESSLIST has no Exasol equivalent. Serve it from the
+    # INFORMATION_SCHEMA.PROCESSLIST view so both spellings agree, relabelling
+    # to the mixed-case names SHOW returns and clients match on. MariaDB
+    # truncates Info to 100 chars without FULL -- not reproduced, since Exasol
+    # gives us the current activity rather than query text anyway.
+    if not isinstance(tree, exp.Show) or tree.name != "PROCESSLIST":
+        return None
+    cols = ", ".join('"' + src + '" AS "' + label + '"'
+                     for src, label in _PROCESSLIST_COLUMNS)
+    return ("SELECT " + cols
+            + ' FROM "INFORMATION_SCHEMA"."PROCESSLIST"')
+
+
+
+_TABLE_STATUS_COLUMNS = (
+    ("TABLE_NAME", "Name"),
+    ("ENGINE", "Engine"),
+    ("VERSION", "Version"),
+    ("ROW_FORMAT", "Row_format"),
+    ("TABLE_ROWS", "Rows"),
+    ("AVG_ROW_LENGTH", "Avg_row_length"),
+    ("DATA_LENGTH", "Data_length"),
+    ("MAX_DATA_LENGTH", "Max_data_length"),
+    ("INDEX_LENGTH", "Index_length"),
+    ("DATA_FREE", "Data_free"),
+    ("AUTO_INCREMENT", "Auto_increment"),
+    ("CREATE_TIME", "Create_time"),
+    ("UPDATE_TIME", "Update_time"),
+    ("CHECK_TIME", "Check_time"),
+    ("TABLE_COLLATION", "Collation"),
+    ("CHECKSUM", "Checksum"),
+    ("CREATE_OPTIONS", "Create_options"),
+    ("TABLE_COMMENT", "Comment"),
+)
+
+
+def _rewrite_show_table_status(tree):
+    # SHOW TABLE STATUS is INFORMATION_SCHEMA.TABLES under different column
+    # names, so serve it from that view rather than duplicating the mapping.
+    # The schema and LIKE comparisons are case-insensitive to match how Exasol
+    # resolves identifiers under SQL_IDENTIFIER_COMPARISON = 'IGNORE CASE'.
+    # Every storage-engine number the view reports as NULL stays NULL here --
+    # clients display them, they do not compute with them.
+    if not isinstance(tree, exp.Show) or tree.name != "TABLE STATUS":
+        return None
+    if tree.args.get("where") is not None:
+        return None
+
+    cols = ", ".join('"' + src + '" AS "' + label + '"'
+                     for src, label in _TABLE_STATUS_COLUMNS)
+    db = tree.args.get("db")
+    schema = (_sql_string(db.name.upper()) if db is not None
+              else 'UPPER(CURRENT_SCHEMA)')
+    sql = ("SELECT " + cols
+           + ' FROM "INFORMATION_SCHEMA"."TABLES"'
+           + ' WHERE UPPER("TABLE_SCHEMA") = ' + schema)
+
+    like = tree.args.get("like")
+    if like is not None:
+        sql += ' AND UPPER("TABLE_NAME") LIKE UPPER(' + _sql_string(like.name) + ')'
+    return sql
+
+
+_SET_STATEMENT_RE = re.compile(r"\s*SET\s+STATEMENT\s+", re.IGNORECASE)
+
+
+def _skip_ws_comments(sql, i):
+    # Advance past any run of whitespace and comments, returning the new index.
+    # Handles MariaDB's three comment forms: `# ...`, `-- ...` (both to EOL) and
+    # `/* ... */`. An unterminated comment swallows the rest of the string.
+    # NB: /*! ... */ executable comments are treated as plain comments — they
+    # only ever appear in the discarded prefix, and Exasol wouldn't honour a
+    # MySQL versioned hint anyway.
+    n = len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+        elif ch == "#" or sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            break
+    return i
+
+
+# MariaDB applies sql_select_limit to the outermost result of a SELECT, and it
+# is the ONLY variable in the SET STATEMENT list with an Exasol equivalent, so
+# it is the only one translated — the rest are dropped. That is not laziness:
+# max_statement_time maps to Exasol QUERY_TIMEOUT but only via a separate
+# ALTER SESSION statement, and the preprocessor is strictly one-statement-in /
+# one-statement-out; foreign_key_checks and sql_mode have no analogue at all.
+#
+# Dropping it outright (the original behaviour) is not viable: the router
+# fetches the WHOLE result set before anything downstream can stop reading, so
+# "SET STATEMENT SQL_SELECT_LIMIT=10 FOR SELECT * FROM orders" became an
+# unbounded scan — measured at 272s for 100k rows versus 1ms on MariaDB, on
+# every DbVisualizer preview.
+#
+# Values are recovered from `seen`, which accumulates only the UNQUOTED,
+# UNCOMMENTED characters of the variable list, so a string value that happens to
+# contain "sql_select_limit=5" cannot be misread as the real setting. The regex
+# requires a digit, so `sql_select_limit=DEFAULT` (MariaDB's reset-to-unlimited)
+# correctly yields no limit. The last assignment wins, matching MariaDB.
+_SQL_SELECT_LIMIT_RE = re.compile(
+    r"(?:^|,)\s*(?:@@)?(?:(?:session|local)\.)?sql_select_limit\s*=\s*(\d+)",
+    re.IGNORECASE)
+
+
+def _strip_set_statement(sql):
+    # Returns (inner_statement, sql_select_limit_or_None).
+    m = _SET_STATEMENT_RE.match(sql, _skip_ws_comments(sql, 0))
+    if not m:
+        return sql, None
+    i = m.end()
+    n = len(sql)
+    depth = 0
+    quote = ""
+    delim = True
+    seen = []
+    while i < n:
+        ch = sql[i]
+        if quote:
+            if ch == "\\" and quote != "`":
+                i += 1
+            elif ch == quote:
+                if i + 1 < n and sql[i + 1] == quote:
+                    i += 1          # doubled quote -> escaped, stay in string
+                else:
+                    quote = ""
+            i += 1
+            continue
+        j = _skip_ws_comments(sql, i)
+        if j > i:
+            i = j
+            delim = True
+            seen.append(" ")
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            seen.append(" ")       # blank out quoted values, see above
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch in ",=":
+            delim = True
+            seen.append(ch)
+            i += 1
+            continue
+        elif depth == 0 and delim and sql[i:i + 3].upper() == "FOR":
+            after = sql[i + 3:i + 4]
+            if not (after.isalnum() or after == "_"):
+                # lstrip() only, not _skip_ws_comments: a comment that belongs
+                # to the payload ("FOR /*hint*/ SELECT") is the user's, and
+                # sqlglot parses it fine — don't silently eat it.
+                return sql[i + 3:].lstrip(), _select_limit_of("".join(seen))
+        else:
+            seen.append(ch)
+        delim = False
+        i += 1
+    # Malformed / no FOR keyword: leave untouched and let it fail naturally
+    # rather than silently mangling the statement.
+    return sql, None
+
+
+def _select_limit_of(vars_text):
+    m = None
+    for m in _SQL_SELECT_LIMIT_RE.finditer(vars_text):
+        pass
+    return int(m.group(1)) if m else None
+
+
+# exp.SetOperation is the base of Union/Except/Intersect. MariaDB caps the
+# combined result of a set operation, and those parse to SetOperation, NOT
+# exp.Select — an isinstance(tree, exp.Select) check alone would skip them and
+# let the unbounded scan straight back in. Guarded with getattr for older
+# sqlglot builds that only expose exp.Union.
+_SET_OPERATION = getattr(exp, "SetOperation", exp.Union)
+
+
+def _is_zero_literal(node):
+    return isinstance(node, exp.Literal) and node.is_int and int(node.this) == 0
+
+
+def _order_by_offsets(tree):
+    # Exasol rejects OFFSET without ORDER BY. MariaDB allows it but guarantees
+    # no particular order, so ordering by the first column is a conformant
+    # reading -- and it is what a paging client wants, since without a stable
+    # order successive pages can repeat or skip rows. Costs a sort, so only do
+    # it where Exasol would otherwise refuse the query: an OFFSET of 0 changes
+    # nothing, so drop it outright rather than sort for it. MySQL clients paging
+    # from the start send `LIMIT 0, n`, which arrives in exactly that shape.
+    for node in tree.find_all(exp.Select, _SET_OPERATION):
+        offset = node.args.get("offset")
+        if offset is None or node.args.get("order") is not None:
+            continue
+        if _is_zero_literal(offset.expression):
+            node.set("offset", None)
+            continue
+        node.set("order", exp.Order(expressions=[
+            exp.Ordered(this=exp.Literal.number(1))]))
+    return tree
+
+
 def _transpile(request):
+    request, select_limit = _strip_set_statement(request)
     tree = sqlglot.parse_one(request, read="mysql")
     if tree is None:
         return request
     sysvars = _rewrite_session_var_select(tree)
     if sysvars is not None:
         return sysvars
+    showvars = _rewrite_show_variables(tree)
+    if showvars is not None:
+        return showvars
+    charset = _rewrite_show_charset(tree)
+    if charset is not None:
+        return charset
+    collation = _rewrite_show_collation(tree)
+    if collation is not None:
+        return collation
+    create_table = _rewrite_show_create_table(tree)
+    if create_table is not None:
+        return create_table
+    engines = _rewrite_show_engines(tree)
+    if engines is not None:
+        return engines
+    plugins = _rewrite_show_plugins(tree)
+    if plugins is not None:
+        return plugins
+    procs = _rewrite_show_processlist(tree)
+    if procs is not None:
+        return procs
+    status = _rewrite_show_table_status(tree)
+    if status is not None:
+        return status
     tree = tree.transform(_rewrite_to_util)
+    # An explicit LIMIT in the statement WINS over sql_select_limit in MariaDB,
+    # even when it is larger (verified: sql_select_limit=3 with LIMIT 7 returns
+    # 7 rows). So this must never overwrite an existing limit — tree.limit()
+    # would silently replace it and return the wrong rows, not merely more of
+    # them. SHOW/INSERT/DDL have no .limit() and fall through untouched; MariaDB
+    # does cap SHOW, so that stays a known, accepted divergence.
+    if (select_limit is not None
+            and isinstance(tree, (exp.Select, _SET_OPERATION))
+            and not tree.args.get("limit")):
+        tree = tree.limit(select_limit)
+    tree = _order_by_offsets(tree)
     return tree.sql(dialect="exasol", identify=True)
 
 
 def _rewrite_to_util(node):
+    # @@vars are not only bare projections: clients write @@sql_mode LIKE ...,
+    # CONCAT(@@x, ...), WHERE @@x = ... . Exasol has no @@ syntax at all, so
+    # resolve the node wherever it appears rather than only as a whole SELECT.
+    if isinstance(node, exp.SessionParameter):
+        val = _sysvar_value(_sysvar_key(node))
+        if val is None:
+            return exp.Null()
+        if val.isdigit():
+            return exp.Literal.number(val)
+        return exp.Literal.string(val)
+
     if (isinstance(node, exp.Column)
             and node.table == ""
             and node.name

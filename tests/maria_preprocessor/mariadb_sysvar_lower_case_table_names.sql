@@ -1,0 +1,1 @@
+SELECT @@lower_case_table_names

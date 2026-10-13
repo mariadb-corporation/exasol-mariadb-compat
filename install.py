@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Install the UTIL.* MariaDB-compat UDFs into an Exasol database.
 
-Scans udfs/**/*.sql recursively and runs each as a single CREATE OR REPLACE.
+Scans udfs/**, preprocessor/** and views/**/*.sql recursively and runs each as a
+single CREATE OR REPLACE.
 Idempotent — safe to re-run to update existing UDFs.
 
 Install: pip install pyexasol
+
+Example:
+
+    python install.py --host 127.0.0.1 --port 8563 --user sys --password exasol --no-ssl-verify
 """
 from __future__ import annotations
 
@@ -21,22 +26,30 @@ except ImportError:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--host", default="localhost")
+    p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", default="8563")
     p.add_argument("--user", default="sys")
     p.add_argument("--password", default="exasol")
-    p.add_argument("--no-ssl-verify", action="store_true",
-                   help="Skip Exasol TLS cert validation (for docker-db's self-signed cert)")
+    # Default off: docker-db ships a self-signed cert. --no-ssl-verify stays
+    # accepted as a no-op so existing commands keep working.
+    p.add_argument("--no-ssl-verify", action="store_true", default=True,
+                   help="Skip Exasol TLS cert validation (default; docker-db's self-signed cert)")
+    p.add_argument("--ssl-verify", dest="no_ssl_verify", action="store_false",
+                   help="Validate Exasol's TLS cert (default is to skip validation)")
     p.add_argument("--udfs-dir", type=Path, default=Path(__file__).parent / "udfs",
                    help="Root directory to scan for UDF *.sql files (default: ./udfs)")
     p.add_argument("--preprocessor-dir", type=Path,
                    default=Path(__file__).parent / "preprocessor",
                    help="Root directory to scan for preprocessor *.sql files (default: ./preprocessor)")
+    p.add_argument("--views-dir", type=Path, default=Path(__file__).parent / "views",
+                   help="Root directory to scan for view *.sql files (default: ./views)")
     args = p.parse_args()
 
     sql_files = sorted(args.udfs_dir.rglob("*.sql"))
     if args.preprocessor_dir.exists():
         sql_files.extend(sorted(args.preprocessor_dir.rglob("*.sql")))
+    if args.views_dir.exists():
+        sql_files.extend(sorted(args.views_dir.rglob("*.sql")))
     if not sql_files:
         print(f"[warn] no .sql files found under {args.udfs_dir} or {args.preprocessor_dir}", file=sys.stderr)
         return 0
@@ -53,11 +66,12 @@ def main() -> int:
         print(f"[setup] connection failed: {e}", file=sys.stderr)
         return 3
 
-    try:
-        c.execute("CREATE SCHEMA IF NOT EXISTS UTIL")
-    except Exception as e:
-        print(f"[setup] CREATE SCHEMA UTIL failed: {e}", file=sys.stderr)
-        return 3
+    for schema in ("UTIL", "INFORMATION_SCHEMA"):
+        try:
+            c.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+        except Exception as e:
+            print(f"[setup] CREATE SCHEMA {schema} failed: {e}", file=sys.stderr)
+            return 3
 
     repo_root = Path(__file__).parent.resolve()
     for f in sql_files:

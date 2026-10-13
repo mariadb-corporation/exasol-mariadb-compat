@@ -1,0 +1,1 @@
+SELECT @@SESSION.sql_mode LIKE '%ORACLE%'

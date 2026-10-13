@@ -37,6 +37,12 @@ const cfg = {
   // Buffers in -> strings out, integers as JS numbers; tests have no BIGINT
   // ranges that overflow JS number precision.
   bigIntAsNumber: true,
+  // Positional rows, like every other runner here. With name-keyed row objects
+  // the column order is JS object property order, and ECMAScript enumerates
+  // integer-like keys FIRST in numeric order -- so a result column that happens
+  // to be *named* e.g. `16777216` (as an unaliased literal projection is) jumps
+  // ahead of its siblings and Object.values() reports the values out of order.
+  rowsAsArray: true,
 };
 
 function emit(obj) {
@@ -50,7 +56,8 @@ function normalize(rows) {
   if (!Array.isArray(rows)) return [];
   return rows.map((r) => {
     if (Array.isArray(r)) return r.map(decode);
-    // Row as object: order columns by insertion (driver preserves SELECT order)
+    // Fallback only: with rowsAsArray the driver already yields arrays. Object
+    // rows cannot preserve SELECT order when a column name is integer-like.
     return Object.values(r).map(decode);
   });
 }
