@@ -1,13 +1,13 @@
-DROP TABLE IF EXISTS `json_test`;
+DROP TABLE IF EXISTS `json_extract_test`;
 
-CREATE TABLE `json_test` (
+CREATE TABLE `json_extract_test` (
     `ID`          INT,
     `JSON`        LONGTEXT,
     `DESCRIPTION` VARCHAR(100),
     PRIMARY KEY (`ID`)
 );
 
-INSERT INTO `json_test` VALUES
+INSERT INTO `json_extract_test` VALUES
     (1, '{"a": 100, "b": "hello"}',        'Standard Integer'),
     (2, '{"a": "apple", "b": 200}',        'Standard String'),
     (3, '{"b": 300}',                       'Missing Key'),
