@@ -4,8 +4,7 @@ MariaDB-compatible SQL UDFs for Exasol. Pairs with a MariaDB→Exasol query
 rewriter (e.g. a sqlglot-based preprocessor) so apps written against MariaDB
 run unchanged against Exasol.
 
-All UDFs live in `UTIL.*` and are `CREATE OR REPLACE` — the same command
-installs fresh and updates.
+All UDFs live in `UTIL.*` and are `CREATE OR REPLACE`
 
 ## Quick start
 
@@ -16,11 +15,16 @@ High level all you need to do is import `dist/mariadb-compat.sql`
 ```sh
 curl -sSL -o mariadb-compat.sql https://raw.githubusercontent.com/mariadb-AllenHerrera/exasol-mariadb-compat/main/dist/mariadb-compat.sql
 ```
-This file is regenerated every PR and contains all the UDFs and main preprocessor function
+This file contains all the UDFs
 
 ### 2) Import the SQL file into Exasol
 
-Option A) Via Python (pyexasol) — **recommended**, installs all 9 scripts
+Option A) Via Exaplus
+```sh
+exaplus -c <host>:8563 -u sys -p <pw> -f mariadb-compat.sql
+```
+
+Option B) Via Python (pyexasol)
 ```sh
 git clone https://github.com/mariadb-AllenHerrera/exasol-mariadb-compat.git
 cd exasol-mariadb-compat
@@ -28,20 +32,6 @@ cd exasol-mariadb-compat
 pip install pyexasol
 python install.py --host <host> --user sys --password <pw> [--no-ssl-verify]
 ```
-
-Option B) Via Exaplus
-```sh
-exaplus -c <host>:8563 -u sys -p <pw> -f mariadb-compat.sql
-```
-
-Exaplus 25.2.6 does not enter script-body mode for
-`CREATE … PREPROCESSOR SCRIPT` (it works fine for `SCALAR SCRIPT`), so
-the body is parsed as SQL and any `;` or unbalanced `'` in a Python
-comment terminates the statement early. `build.sh` works around this
-by stripping comment-only lines from preprocessor bodies in the bundle
-and terminating each preprocessor with a bare `;`. Source files keep
-their human-readable comments, so `install.py` still ships the full
-documented body to the catalog.
 
 Re-run either command any time to pick up new/updated UDFs.
 
