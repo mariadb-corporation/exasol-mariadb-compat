@@ -1,13 +1,11 @@
-CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT UTIL.MARIA_PREPROCESSOR AS
-
 import json
 import re
 import sqlglot
 from sqlglot import expressions as exp
 
 
-_PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "773baaa-dirty"
+_PREPROCESSOR_VERSION = "2026.10.0"
+_PREPROCESSOR_BUILD = "c8649c7-dirty"
 
 
 def adapter_call(request):

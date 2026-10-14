@@ -20,9 +20,10 @@ PREPROCESSOR_DIR = pathlib.Path(__file__).resolve().parent.parent / "preprocesso
 
 
 def load_adapter(safe: bool):
-    fname = "maria_preprocessor.sql" if safe else "maria_preprocessor_debug.sql"
-    src = (PREPROCESSOR_DIR / fname).read_text()
-    body = src.split(" AS\n", 1)[1]
+    fname = "maria_preprocessor.py" if safe else "maria_preprocessor_debug.sql"
+    body = (PREPROCESSOR_DIR / fname).read_text()
+    if not safe:
+        body = body.split(" AS\n", 1)[1]  # drop the CREATE ... AS header
     ns: dict = {}
     exec(compile(body, fname, "exec"), ns)
     return ns["adapter_call"]

@@ -31,8 +31,8 @@ from sqlglot import expressions as exp
 # _rewrite_session_var_select below answers it with a canned SELECT.
 # NB: production maria_preprocessor.sql keeps these same statements but with NO
 # comments — the documentation lives here in the debug variant only.
-_PREPROCESSOR_VERSION = "2026.8.0"
-_PREPROCESSOR_BUILD = "773baaa-dirty"
+_PREPROCESSOR_VERSION = "2026.10.0"
+_PREPROCESSOR_BUILD = "c8649c7-dirty"
 
 
 def adapter_call(request):

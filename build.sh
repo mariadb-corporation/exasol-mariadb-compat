@@ -28,7 +28,7 @@ mkdir -p dist
 # `SELECT @@maria_preprocessor_version` reports this build everywhere the source
 # is used directly — install.py and the hand-copied MaxScale sqlglot.custom.udf,
 # not just the dist bundle. Matches the line at any current value (re-stampable).
-for f in preprocessor/*.sql; do
+for f in preprocessor/*.sql preprocessor/*.py; do
     sed -i -E "s|^(_PREPROCESSOR_BUILD = ).*|\1\"${BUILD_TAG}\"|" "$f"
 done
 
@@ -71,7 +71,7 @@ done
     done
 
     # UDFs first (referenced by the preprocessor), then preprocessor — sorted
-    # bytewise (LC_ALL=C) so `maria_preprocessor.sql` (`.` < `_`) precedes
+    # bytewise (LC_ALL=C) so `maria_preprocessor.py` (`.` < `_`) precedes
     # `maria_preprocessor_debug.sql`. Each script body is wrapped in `--/` ...
     # `/` block markers so exaplus enters script-body mode for the embedded
     # Python — without them, exaplus tries to SQL-parse lines like
@@ -93,7 +93,7 @@ done
     done
 
     {
-        LC_ALL=C find preprocessor -name '*.sql' -print0 2>/dev/null | LC_ALL=C sort -z
+        LC_ALL=C find preprocessor \( -name '*.sql' -o -name '*.py' \) -print0 2>/dev/null | LC_ALL=C sort -z
     } | while IFS= read -r -d '' f; do
         echo "-- === ${f} ==="
         # exaplus parses preprocessor bodies as SQL (no script-body mode), so
@@ -103,6 +103,13 @@ done
         # ("node's", "can't") never reach exaplus. The catalog SCRIPT_TEXT
         # ends up comment-stripped; install.py (pyexasol) ships full source.
         # The _PREPROCESSOR_BUILD tag was already stamped in place above.
+        # *.py preprocessors are header-less (MaxScale consumes them as-is), so
+        # synthesize the CREATE header for Exasol; *.sql ones carry their own.
+        if [[ "$f" == *.py ]]; then
+            name="$(basename "$f" .py)"
+            echo "CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT UTIL.${name^^} AS"
+            echo
+        fi
         sed -E '/^[[:space:]]*#/d' "$f"
         echo ";"
         echo

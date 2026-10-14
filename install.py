@@ -40,7 +40,7 @@ def main() -> int:
                    help="Root directory to scan for UDF *.sql files (default: ./udfs)")
     p.add_argument("--preprocessor-dir", type=Path,
                    default=Path(__file__).parent / "preprocessor",
-                   help="Root directory to scan for preprocessor *.sql files (default: ./preprocessor)")
+                   help="Root directory to scan for preprocessor *.sql / *.py files (default: ./preprocessor)")
     p.add_argument("--views-dir", type=Path, default=Path(__file__).parent / "views",
                    help="Root directory to scan for view *.sql files (default: ./views)")
     args = p.parse_args()
@@ -48,6 +48,7 @@ def main() -> int:
     sql_files = sorted(args.udfs_dir.rglob("*.sql"))
     if args.preprocessor_dir.exists():
         sql_files.extend(sorted(args.preprocessor_dir.rglob("*.sql")))
+        sql_files.extend(sorted(args.preprocessor_dir.rglob("*.py")))
     if args.views_dir.exists():
         sql_files.extend(sorted(args.views_dir.rglob("*.sql")))
     if not sql_files:
@@ -79,7 +80,12 @@ def main() -> int:
             rel = f.resolve().relative_to(repo_root)
         except ValueError:
             rel = f
-        stmt = f.read_text().strip().rstrip(";")
+        text = f.read_text()
+        if f.suffix == ".py":
+            # Header-less (MaxScale uses it as-is); add the Exasol CREATE header.
+            text = (f"CREATE OR REPLACE PYTHON3 PREPROCESSOR SCRIPT "
+                    f"UTIL.{f.stem.upper()} AS\n\n{text}")
+        stmt = text.strip().rstrip(";")
         try:
             c.execute(stmt)
             print(f"[ok] installed {rel}")

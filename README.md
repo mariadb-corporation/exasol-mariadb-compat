@@ -66,7 +66,7 @@ then generates the final Exasol SQL.
 
 The rewrite table lives inside the preprocessor script. When adding a new
 UDF here, add a corresponding branch to `_rewrite_to_util` in **both**
-`maria_preprocessor.sql` and `maria_preprocessor_debug.sql` in the same PR.
+`maria_preprocessor.py` and `maria_preprocessor_debug.sql` in the same PR.
 Currently covered:
 
 - `JSON_EXTRACT` → `UTIL.JSON_EXTRACT`
@@ -157,7 +157,7 @@ state.
 
 To eyeball the rewrite without a database in the loop, run the
 preprocessor adapter locally via `tools/standalone_adhoc_test.py` — it
-loads `preprocessor/maria_preprocessor.sql` (or `_debug.sql`) and runs
+loads `preprocessor/maria_preprocessor.py` (or `_debug.sql`) and runs
 its `adapter_call` against SQL on stdin or a file. Uses whichever sqlglot
 is on `PYTHONPATH`, so `pip install -e ../sqlglot` first if you're testing
 fork changes:
@@ -184,7 +184,7 @@ exasol-mariadb-compat/
 │       ├── json_extract.sql    # one CREATE OR REPLACE per file
 │       └── json_object.sql
 ├── preprocessor/
-│   └── maria_preprocessor.sql  # UTIL.MARIA_PREPROCESSOR: AST-level MariaDB → Exasol rewriter
+│   └── maria_preprocessor.py   # UTIL.MARIA_PREPROCESSOR: AST-level MariaDB → Exasol rewriter
 ├── tools/
 │   └── standalone_adhoc_test.py # runs the preprocessor adapter locally (no DB needed)
 ├── dist/

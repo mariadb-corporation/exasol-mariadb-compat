@@ -41,7 +41,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # bind mount, so these are lost if the container is *recreated* (compose
 # down/up) though they survive a restart -- see deploy_preprocessor().
 PREPROC_DIR = "/var/lib/maxscale/preproc"
-PREPROC_SRC = REPO_ROOT / "preprocessor" / "maria_preprocessor.sql"
+PREPROC_SRC = REPO_ROOT / "preprocessor" / "maria_preprocessor.py"
 CNF_DEST = "/etc/maxscale.cnf"
 # preprocessor=internal:/path — the line that selects the active body.
 CNF_PREPROC_RE = re.compile(r"^(\s*preprocessor\s*=\s*internal:)(\S+)\s*$", re.M)
@@ -117,9 +117,9 @@ def _canonical_udf_dest(container: str) -> str | None:
 
 
 def _preprocessor_body() -> tuple[str, str]:
-    """(python body, build tag) from the repo's preprocessor. The first line is
-    the Exasol `CREATE ... PREPROCESSOR SCRIPT ... AS` header, which MaxScale's
-    internal preprocessor must not see -- the rest is portable as-is."""
+    """(python body, build tag) from the repo's preprocessor. The source is
+    header-less (no Exasol `CREATE ... PREPROCESSOR SCRIPT ... AS` line), which
+    MaxScale's internal preprocessor must not see; the strip below is a guard."""
     text = PREPROC_SRC.read_text()
     body = text.split("\n", 1)[1] if text.startswith("CREATE") else text
     ast.parse(body)  # never ship a body that cannot even parse
