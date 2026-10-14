@@ -348,12 +348,12 @@ def _exasol_session_prelude(setup_text: str) -> list[str]:
             if s.upper().startswith("ALTER SESSION")]
 
 
-def _failure_block(label, setup_exasol_text, setup_mariadb_text, sql_text,
+def _failure_block(connector, label, setup_exasol_text, setup_mariadb_text, sql_text,
                    expected, exasol_out, mariadb_out=None) -> str:
     """-vvv detail for one failing test. mariadb_out=None means MariaDB wasn't run."""
     reason = ("Exasol execution error" if str(exasol_out).startswith("ERROR:")
               else "Exasol result != expected")
-    block = [f"{_FAIL_BLOCK_START}{label} ({reason}) ===="]
+    block = [f"{_FAIL_BLOCK_START}[{connector}] {label} ({reason}) ===="]
     if setup_exasol_text.strip():
         block.append(f"       setup.exasol.sql:\n{setup_exasol_text.strip()}")
     if setup_mariadb_text.strip():
@@ -368,9 +368,9 @@ def _failure_block(label, setup_exasol_text, setup_mariadb_text, sql_text,
     return "\n".join(block)
 
 
-def _setup_failure_block(label, setup_text, err) -> str:
+def _setup_failure_block(connector, label, setup_text, err) -> str:
     """-vvv detail for a group-level setup failure (no test SQL/expected exist)."""
-    block = [f"{_FAIL_BLOCK_START}{label} (group setup error) ===="]
+    block = [f"{_FAIL_BLOCK_START}[{connector}] {label} (group setup error) ===="]
     if setup_text.strip():
         block.append(f"       setup:\n{setup_text.strip()}")
         block.append("")
@@ -503,50 +503,96 @@ def _argv_without_connector(argv: list[str]) -> list[str]:
     return out
 
 
+def _scan_child_output(lines, verbose):
+    """(passed, total, note, failure_blocks) from one connector run's output."""
+    import re
+    passed = total = None
+    note = ""
+    block = None
+    blocks = []
+    for line in lines:
+        if verbose >= 3:
+            if line.startswith(_FAIL_BLOCK_START):
+                block = [line]
+            elif block is not None:
+                block.append(line)
+                if line.rstrip() == _FAIL_BLOCK_END:
+                    blocks.append("".join(block))
+                    block = None
+        m = re.search(r"(\d+)/(\d+) passed", line)
+        if m:
+            passed, total = int(m.group(1)), int(m.group(2))
+        if "unavailable:" in line:
+            note = "skipped — " + line.split("unavailable:", 1)[1].strip()
+        elif re.search(r"\[setup\].*(failed|unreachable|not detected)", line):
+            note = line.split("]", 1)[1].strip() if "]" in line else line.strip()
+    return passed, total, note, blocks
+
+
 def _run_many(args, connectors: list[str]) -> int:
     """Run the suite once per connector — each a fresh subprocess so its setup
-    (schema, fixtures) is fully isolated — teeing output live, then print a
-    summary table. The UTIL.* UDFs live in their own schema and persist, so we
-    reload only on the first connector."""
+    (schema, fixtures) is fully isolated — then print a summary table. The
+    UTIL.* UDFs live in their own schema and persist, so they are reloaded once:
+    by the first connector when sequential (output teed live), or by a separate
+    --reload-only run when --parallel (output buffered, per-connector schemas)."""
     import os
-    import re
     import subprocess
+    import threading
     base = [sys.executable, os.path.abspath(__file__)]
     passthrough = _argv_without_connector(sys.argv[1:])
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "RUN_TESTS_CHILD": "1"}
+
+    def spawn(conn, extra):
+        return subprocess.Popen(base + passthrough + ["--connector", conn] + extra,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, env=env)
+
+    outputs = {}  # connector -> (rc, [lines])
+    if args.parallel:
+        extra_all = ["--no-reload"]
+        if not args.no_reload:
+            print(f"[parallel] reloading UTIL.* once before starting {len(connectors)} connectors")
+            r = subprocess.run(base + passthrough + ["--connector", connectors[0], "--reload-only"],
+                               capture_output=True, text=True, env=env)
+            if r.returncode != 0:
+                sys.stdout.write(r.stdout + r.stderr)
+                print("[parallel] reload failed; not starting connectors", file=sys.stderr)
+                return 1
+
+        def work(conn):
+            proc = spawn(conn, extra_all + ["--schema", f"{args.schema}_{conn.upper()}"])
+            lines = list(proc.stdout)
+            outputs[conn] = (proc.wait(), lines)
+            print(f"[parallel] {conn} finished (exit {outputs[conn][0]})", flush=True)
+
+        threads = [threading.Thread(target=work, args=(c,)) for c in connectors]
+        print(f"[parallel] running {', '.join(connectors)} concurrently "
+              f"(schemas {args.schema}_<CONNECTOR>)", flush=True)
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for conn in connectors:
+            print(f"\n==== connector: {conn} ====")
+            sys.stdout.write("".join(outputs[conn][1]))
+    else:
+        for i, conn in enumerate(connectors):
+            extra = ["--no-reload"] if i > 0 and not args.no_reload else []  # loaded by the first run
+            print(f"\n==== connector: {conn} ====")
+            proc = spawn(conn, extra)
+            lines = []
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                lines.append(line)
+            outputs[conn] = (proc.wait(), lines)
+
     rows = []
     last_fail = None  # (connector, [blocks]) for the last connector with -vvv failures
-    for i, conn in enumerate(connectors):
-        argv = base + passthrough + ["--connector", conn]
-        if i > 0 and not args.no_reload:
-            argv.append("--no-reload")  # UTIL.* already loaded by the first run
-        print(f"\n==== connector: {conn} ====")
-        passed = total = None
-        note = ""
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, env=env)
-        block = None
-        conn_blocks = []
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            if args.verbose >= 3:
-                if line.startswith(_FAIL_BLOCK_START):
-                    block = [line]
-                elif block is not None:
-                    block.append(line)
-                    if line.rstrip() == _FAIL_BLOCK_END:
-                        conn_blocks.append("".join(block))
-                        block = None
-            m = re.search(r"(\d+)/(\d+) passed", line)
-            if m:
-                passed, total = int(m.group(1)), int(m.group(2))
-            if "unavailable:" in line:
-                note = "skipped — " + line.split("unavailable:", 1)[1].strip()
-            elif re.search(r"\[setup\].*(failed|unreachable|not detected)", line):
-                note = line.split("]", 1)[1].strip() if "]" in line else line.strip()
-        rc = proc.wait()
-        if conn_blocks:
-            last_fail = (conn, conn_blocks)
+    for conn in connectors:
+        rc, lines = outputs[conn]
+        passed, total, note, blocks = _scan_child_output(lines, args.verbose)
+        if blocks:
+            last_fail = (conn, blocks)
         rows.append((conn, rc, passed, total, note))
 
     if last_fail is not None:
@@ -636,6 +682,13 @@ def main() -> int:
                    default=Path(__file__).resolve().parent.parent,
                    help="Repo root used by the reload step (looks up dist/mariadb-compat.sql "
                         "underneath; default: parent of tests/)")
+    p.add_argument("--parallel", action="store_true",
+                   help="With several connectors, run them concurrently. UTIL.* is reloaded once "
+                        "up front, then each connector gets its own schema/database "
+                        "(<--schema>_<CONNECTOR>) so fixtures, CDC and cleanup don't collide; "
+                        "output is buffered and printed per connector when all finish.")
+    p.add_argument("--reload-only", action="store_true",
+                   help="Install dist/mariadb-compat.sql into Exasol and exit (used by --parallel).")
     p.add_argument("--schema", default="MARIADB_COMPAT_TEST",
                    help="Ephemeral schema for fixtures (dropped at end)")
     p.add_argument("--udf", action="append", default=None,
@@ -741,6 +794,8 @@ def main() -> int:
         except Exception as e:
             print(f"[reload] failed: {e}", file=sys.stderr)
             return 3
+    if args.reload_only:
+        return 0
 
     try:
         c.execute(f"CREATE SCHEMA IF NOT EXISTS {args.schema}")
@@ -995,7 +1050,7 @@ def main() -> int:
                 print(f"[FAIL] {udf_dir.name}/setup.exasol: {e}", file=sys.stderr)
                 failed += 1
                 if args.verbose >= 3:
-                    text = _setup_failure_block(f"{udf_dir.name}/setup.exasol",
+                    text = _setup_failure_block(args.connector, f"{udf_dir.name}/setup.exasol",
                                                 setup_exasol_text, e)
                     print("\n" + text)
                     print(_FAIL_BLOCK_END)
@@ -1016,7 +1071,7 @@ def main() -> int:
                 print(f"[FAIL] {udf_dir.name}/setup.mariadb: {e}", file=sys.stderr)
                 failed += 1
                 if args.verbose >= 3:
-                    text = _setup_failure_block(f"{udf_dir.name}/setup.mariadb",
+                    text = _setup_failure_block(args.connector, f"{udf_dir.name}/setup.mariadb",
                                                 setup_text, e)
                     print("\n" + text)
                     print(_FAIL_BLOCK_END)
@@ -1034,7 +1089,7 @@ def main() -> int:
                     print(f"[FAIL] {udf_dir.name}/cdc-wait: {e}", file=sys.stderr)
                     failed += 1
                     if args.verbose >= 3:
-                        text = _setup_failure_block(f"{udf_dir.name}/cdc-wait",
+                        text = _setup_failure_block(args.connector, f"{udf_dir.name}/cdc-wait",
                                                     setup_text, e)
                         print("\n" + text)
                         print(_FAIL_BLOCK_END)
@@ -1049,19 +1104,21 @@ def main() -> int:
                 print(f"[skip] {udf_dir.name}/{name}: no .expected.json")
                 continue
             label = f"{udf_dir.name}/{name}"
-            sql_text = sql_file.read_text()
+            # Tests name the default schema literally; point them at this run's.
+            sql_text = sql_file.read_text().replace("MARIADB_COMPAT_TEST", args.schema)
             if args.verbose:
                 print(f"[run]  {label}")
                 print(f"       sql     : {sql_text.strip()}")
             expected = "<not loaded>"
             try:
                 rows = runner.execute(label, sql_text)
-                expected = json.loads(expected_file.read_text())
+                expected = json.loads(
+                    expected_file.read_text().replace("MARIADB_COMPAT_TEST", args.schema))
             except Exception as e:
                 print(f"[FAIL] {label}: {e}", file=sys.stderr)
                 failed += 1
                 if args.verbose >= 3:
-                    text = _failure_block(label, setup_exasol_text, setup_mariadb_text,
+                    text = _failure_block(args.connector, label, setup_exasol_text, setup_mariadb_text,
                                           sql_text, expected, f"ERROR: {e}")
                     print("\n" + text)
                     print(_FAIL_BLOCK_END)
@@ -1105,7 +1162,7 @@ def main() -> int:
             # [ok] test with a MariaDB DIFF/ERROR is not recapped.
             if args.verbose >= 3 and had_error:
                 text = _failure_block(
-                    label, setup_exasol_text, setup_mariadb_text, sql_text, expected, rows,
+                    args.connector, label, setup_exasol_text, setup_mariadb_text, sql_text, expected, rows,
                     None if mc is None else ('ERROR: ' + str(merr) if merr else mrows))
                 print("\n" + text)
                 print(_FAIL_BLOCK_END)
