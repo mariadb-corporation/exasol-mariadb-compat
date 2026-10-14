@@ -2,9 +2,9 @@
 """Run the MARIA_PREPROCESSOR rewrite locally — outside Exasol — to eyeball
 the MariaDB SQL going in and the Exasol SQL coming out.
 
-  echo 'SELECT FIELD(x,"a","b") FROM t' | python3 standalone_adhoc_test.py
-  python3 standalone_adhoc_test.py path/to/query.sql
-  python3 standalone_adhoc_test.py --safe < query.sql   # use non-DEBUG variant
+  echo 'SELECT FIELD(x,"a","b") FROM t' | python3 local_adhoc_test.py
+  python3 local_adhoc_test.py path/to/query.sql
+  python3 local_adhoc_test.py --safe < query.sql   # use non-DEBUG variant
 
 Uses whichever sqlglot is on the local PYTHONPATH (pip install -e ../sqlglot
 to test fork changes).
@@ -53,7 +53,9 @@ def sqlglot_banner() -> str:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="example:\n  echo 'SELECT FIELD(x,\"a\",\"b\") FROM t' | python3 tools/local_adhoc_test.py")
     ap.add_argument("file", nargs="?", help="SQL file (default: stdin)")
     ap.add_argument("--safe", action="store_true",
                     help="use MARIA_PREPROCESSOR (swallows errors) instead of _DEBUG")
