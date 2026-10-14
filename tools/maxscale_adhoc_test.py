@@ -3,7 +3,7 @@
 — exec into MaxScale, report its sqlglot version, and transpile custom SQL with
 the container's own maria_preprocessor (the exasolrouter's `adapter_call`).
 
-This is the MaxScale-side counterpart to standalone_adhoc_test.py: instead of
+This is the MaxScale-side counterpart to local_adhoc_test.py: instead of
 the local fork + the in-repo preprocessor SQL, it uses MaxScale's bundled
 sqlglot (/usr/lib64/maxscale/python3/site-packages) and the deployed
 /usr/share/maxscale/maria_preprocessor.py, so you see exactly what the router
@@ -53,7 +53,9 @@ print(fn(sql))
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="example:\n  echo 'SELECT FIELD(x,\"a\",\"b\") FROM t' | python3 tools/maxscale_adhoc_test.py")
     ap.add_argument("file", nargs="?", help="SQL file (default: stdin)")
     ap.add_argument("--safe", action="store_true",
                     help="use adapter_call (swallows errors, returns input on failure) "
