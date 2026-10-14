@@ -35,133 +35,71 @@ python install.py --host <host> --user sys --password <pw> [--no-ssl-verify]
 
 Re-run either command any time to pick up new/updated UDFs.
 
-## What's shipped today
+## How it works
 
-### UDFs (`udfs/`)
+Apps send MariaDB SQL to MaxScale's `exasolrouter`, which runs a
+sqlglot-based preprocessor (`preprocessor/maria_preprocessor.py`) to rewrite
+it into Exasol SQL. Where Exasol has an equivalent, sqlglot emits it directly.
+Where it doesn't, the preprocessor maps the MariaDB function onto a UDF from
+this pack (`udfs/`, installed into `UTIL.*`):
 
-| UDF | MariaDB function | Notes |
-|---|---|---|
-| `UTIL.JSON_EXTRACT(doc, paths_json_array)` | `JSON_EXTRACT(doc, p1, ..., pN)` | Single path → JSON-typed value; multi-path → JSON array of matches with missing paths silently skipped; all-missing → NULL. Path grammar: `$`, `$.key`, `$[idx]`, dotted/indexed chains. Wildcards (`$**`, `$[*]`) not yet supported. |
-| `UTIL.JSON_OBJECT(k1, v1, ..., kN, vN)` | `JSON_OBJECT(k1, v1, ...)` | Variadic key/value pairs → JSON object. DECIMAL values render as integers or floats; DATE / TIMESTAMP render as ISO-8601 strings. Odd-arg or NULL-key calls raise. |
+| MariaDB | Exasol |
+|---|---|
+| `JSON_EXTRACT(doc, p1, ..., pN)` | `UTIL.JSON_EXTRACT(...)` |
+| `JSON_OBJECT(k, v, ...)` | `UTIL.JSON_OBJECT(...)` |
+| `JSON_OBJECTAGG(k, v)` | `UTIL.JSON_OBJECTAGG(...)` |
+| `JSON_MERGE_PRESERVE(...)` | `UTIL.JSON_MERGE_PRESERVE(...)` |
+| `JSON_QUOTE(s)` / `JSON_UNQUOTE(s)` | `UTIL.JSON_QUOTE(s)` / `UTIL.JSON_UNQUOTE(s)` |
+| `ELT(n, s1, ...)` / `FIELD(x, s1, ...)` | `UTIL.ELT(...)` / `UTIL.FIELD(...)` |
 
-### Preprocessor (`preprocessor/`)
+The preprocessor also answers a few MariaDB-only statements itself (such as
+`SHOW ENGINES` or `@@variable` lookups), and `views/` adds MariaDB-style
+`INFORMATION_SCHEMA` views over Exasol's catalog so clients like DBeaver work.
 
-`UTIL.MARIA_PREPROCESSOR` is an Exasol preprocessor script that, when
-activated with `ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR`,
-transparently rewrites MariaDB SQL into Exasol SQL before it reaches the
-engine. Under the hood it uses `sqlglot` (from whatever SLC is active) to
-parse MariaDB, walks the AST rewriting specific constructs into calls
-against the UDFs above (or into native Exasol functions where they match),
-then generates the final Exasol SQL.
-
-The rewrite table lives inside the preprocessor script. When adding a new
-UDF here, add a corresponding branch to `_rewrite_to_util` in **both**
-`maria_preprocessor.py` and `maria_preprocessor_debug.sql` in the same PR.
-Currently covered:
-
-- `JSON_EXTRACT` → `UTIL.JSON_EXTRACT`
-- `JSON_OBJECT` → `UTIL.JSON_OBJECT`
-
-#### Safe vs debug variants
-
-Two preprocessor scripts ship side by side, identical rewrite rules,
-different error handling. Toggle per session:
-
-```sql
--- Production / day-to-day: any sqlglot failure (parse error, transform
--- bug, unknown construct) returns the original statement so Exasol gets
--- to execute or reject it. Exasol-only syntax sails through unchanged.
-ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR;
-
--- Development: errors raise as full Python tracebacks via Exasol's
--- "While preprocessing SQL with..." wrapper, so you can see exactly
--- where sqlglot or the rewrite logic broke.
-ALTER SESSION SET sql_preprocessor_script=UTIL.MARIA_PREPROCESSOR_DEBUG;
-```
-
-## Adding or updating UDFs (build from source)
-
-1. Drop a single `CREATE OR REPLACE PYTHON3 SCALAR SCRIPT UTIL.<name>(...) ...`
-   into `udfs/<category>/<name>.sql`. No trailing `;` or `/`.
-2. Run `./build.sh` to regenerate `dist/mariadb-compat.sql` (stamped with the
-   current `git describe` version).
-3. Commit both the UDF source and the updated `dist/` file.
+To deploy the preprocessor into MaxScale: `python3 tools/deploy_sqlglot_to_maxscale.py`.
 
 ## Testing
 
-Each UDF has a directory under `tests/` with optional per-engine fixtures
-(`setup.exasol.sql` and/or `setup.mariadb.sql`) plus `<case>.sql` +
-`<case>.expected.json` pairs. Rows are compared stringified so `DECIMAL` /
-`int` / `float` collapse.
+Each directory under `tests/` is a group: optional `setup.exasol.sql` /
+`setup.mariadb.sql` fixtures plus `<case>.sql` and `<case>.expected.json`
+pairs. Rows are compared as strings.
+
+The main command:
 
 ```sh
-# Prereq: UTIL.* already installed (see Quick start)
-# Exasol TLS cert validation is skipped by default (docker-db ships a
-# self-signed cert); pass --ssl-verify to enforce it.
-pip install pyexasol
-python tests/run_tests.py --host 127.0.0.1 --user sys --password exasol --port 8563
-
-# Only one UDF:
-python tests/run_tests.py --udf json_object
-
-# Cross-check each case against MariaDB (auto-spawns mariadb:11.8 on :3306
-# if nothing's there; needs `pip install pymysql`):
-python tests/run_tests.py --compare-direct
-
-# End-to-end check via an existing CDC pipe MariaDB → Exasol. Skips
-# setup.exasol.sql DDL/data (CDC owns it; only ALTER SESSION lines are kept
-# as session prelude), runs setup.mariadb.sql on MariaDB, and waits for CDC
-# to propagate before running each case on both engines:
-python tests/run_tests.py --compare-with-cdc \
-    --mariadb-user admin_user --mariadb-password 'aBc123%%'
-
-# Route test execution through MaxScale (port 3311 by default) using a
-# specific MariaDB connector. Setup still uses pyexasol direct; only test
-# SQL goes via the chosen runner. See tests/connectors/README.md for the
-# JSON Lines protocol each runner implements and the available choices
-# (currently nodejs, python_pymysql, python_mariadb):
-python tests/run_tests.py --connector nodejs \
-    --maxscale-host 127.0.0.1 --maxscale-port 3311 \
-    --mariadb-user admin_user --mariadb-password 'aBc123%%' \
-    --udf set_names
+python tests/run_tests.py --no-ssl-verify --via-maxscale --compare-with-cdc -vvv --connector all --parallel
 ```
 
-Each connector runner is also standalone-runnable on stdin/stdout for
-ad-hoc probes (useful as a reproducer for upstream MaxScale / connector
-bugs):
+This installs `dist/mariadb-compat.sql` into Exasol, then runs every case
+through MaxScale (port 3311) once per connector (`nodejs`, `python_mariadb`,
+`python_pymysql`, `java`, `mariadb_c`, `mariadb_cpp`), all in parallel, each in
+its own schema. Each result is checked against `.expected.json` and also run
+on MariaDB, whose tables reach Exasol through the CDC pipe. `-vvv` prints the
+full setup, SQL, expected and actual output for every failure.
 
-```sh
-echo '{"name":"q","sql":"SET NAMES utf8"}' | \
-    node tests/connectors/nodejs/runner.js \
-         --host 127.0.0.1 --port 3311 --user admin_user --password 'aBc123%%'
-```
+To run against your own deployment, point it at your hosts and credentials:
 
-The runner creates an ephemeral `MARIADB_COMPAT_TEST` schema, runs each
-group's `setup.exasol.sql` inside it, executes every case, then drops the
-schema. Under `--compare-direct` it also creates a same-named MariaDB
-database, runs `setup.mariadb.sql`, and prints each case's MariaDB output
-alongside Exasol's. Under `--compare-with-cdc` only `setup.mariadb.sql`
-runs on MariaDB; tables and rows arrive on Exasol via CDC, validated with
-a probe table at startup and per-group row-count polling. No persistent
-state.
+| Option | What it points at |
+|---|---|
+| `--host` `--port` `--user` `--password` | MaxScale's `exasolrouter` (default `127.0.0.1:3311`, `admin_user`) |
+| `--exasol-host` `--exasol-port` `--exasol-user` `--exasol-password` | Exasol, for the install, schemas and CDC checks (default `localhost:8563`, `sys`) |
+| `--mariadb-host` `--mariadb-port` `--mariadb-user` `--mariadb-password` | MariaDB, for `--compare-*` (default `127.0.0.1:3306`, `admin_user`) |
+| `--connector` | one connector, a comma-separated list, or `all` |
+| `--udf` | run only this test group (repeatable) |
+| `--schema` | base name for the test schema (default `MARIADB_COMPAT_TEST`) |
+| `--no-reload` | skip reinstalling the bundle first |
 
-To eyeball the rewrite without a database in the loop, run the
-preprocessor adapter locally via `tools/local_adhoc_test.py` — it
-loads `preprocessor/maria_preprocessor.py` (or `_debug.sql`) and runs
-its `adapter_call` against SQL on stdin or a file. Uses whichever sqlglot
-is on `PYTHONPATH`, so `pip install -e ../sqlglot` first if you're testing
-fork changes:
+Run `python tests/run_tests.py --help` for everything else, including
+`--compare-direct` (no CDC) and `--cdc-timeout`. `tests/connectors/README.md`
+describes the connector runners.
+
+To see how a statement is rewritten without a database, pipe it through
+`tools/local_adhoc_test.py` (uses the repo's preprocessor) or
+`tools/maxscale_adhoc_test.py` (uses the one deployed in MaxScale):
 
 ```sh
 echo "SELECT FIELD(x,'a','b') FROM t" | python3 tools/local_adhoc_test.py
-python3 tools/local_adhoc_test.py path/to/query.sql
-python3 tools/local_adhoc_test.py --safe < query.sql   # non-DEBUG variant
 ```
-
-Watch shell quoting: an outer `'…'` is terminated by inner `'`s, so
-`echo '… SELECT 1, ''val''…'` reaches Python with the inner quotes
-stripped and `val` parsed as an identifier. Prefer a heredoc or a file
-when the SQL contains string literals.
 
 ## Layout
 
