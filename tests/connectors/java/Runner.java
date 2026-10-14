@@ -46,7 +46,7 @@ public class Runner {
         // permitMysqlScheme=false avoids the connector trying mysql:// fallbacks.
         // useServerPrepStmts=false because we issue plain Statement.execute().
         String url = String.format(
-            "jdbc:mariadb://%s:%s?user=%s&password=%s",
+            "jdbc:mariadb://%s:%s?user=%s&password=%s&tinyInt1isBit=false",
             args.get("host"), args.get("port"),
             args.get("user"), args.get("password"));
 
