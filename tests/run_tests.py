@@ -560,14 +560,14 @@ def _run_many(args, connectors: list[str]) -> int:
                 return 1
 
         def work(conn):
-            proc = spawn(conn, extra_all + ["--schema", f"{args.schema}_{conn.upper()}"])
+            proc = spawn(conn, extra_all + ["--schema", f"{args.schema}_{conn.lower()}"])
             lines = list(proc.stdout)
             outputs[conn] = (proc.wait(), lines)
             print(f"[parallel] {conn} finished (exit {outputs[conn][0]})", flush=True)
 
         threads = [threading.Thread(target=work, args=(c,)) for c in connectors]
         print(f"[parallel] running {', '.join(connectors)} concurrently "
-              f"(schemas {args.schema}_<CONNECTOR>)", flush=True)
+              f"(schemas {args.schema}_<connector>)", flush=True)
         for t in threads:
             t.start()
         for t in threads:
@@ -685,12 +685,13 @@ def main() -> int:
     p.add_argument("--parallel", action="store_true",
                    help="With several connectors, run them concurrently. UTIL.* is reloaded once "
                         "up front, then each connector gets its own schema/database "
-                        "(<--schema>_<CONNECTOR>) so fixtures, CDC and cleanup don't collide; "
+                        "(<--schema>_<connector>) so fixtures, CDC and cleanup don't collide; "
                         "output is buffered and printed per connector when all finish.")
     p.add_argument("--reload-only", action="store_true",
                    help="Install dist/mariadb-compat.sql into Exasol and exit (used by --parallel).")
-    p.add_argument("--schema", default="MARIADB_COMPAT_TEST",
-                   help="Ephemeral schema for fixtures (dropped at end)")
+    p.add_argument("--schema", default="mariadb_compat_test",
+                   help="Ephemeral schema for fixtures (dropped at end). Must be lowercase with "
+                        "--compare-with-cdc: MaxScale CDC stops on mixed-case database names.")
     p.add_argument("--udf", action="append", default=None,
                    help="Run only these UDF groups (repeatable; default: all)")
     p.add_argument("-v", "--verbose", action="count", default=0,
@@ -987,6 +988,12 @@ def main() -> int:
                 print(f"[setup] mariadb connection failed: {e}", file=sys.stderr)
                 return 3
 
+        if compare_mode == "cdc" and args.schema != args.schema.lower():
+            print(f"[setup] --schema {args.schema!r} must be lowercase with --compare-with-cdc "
+                  "(MaxScale CDC stops with 'already exists' on mixed-case database names)",
+                  file=sys.stderr)
+            return 3
+
         try:
             with mc.cursor() as mcur:
                 # In CDC mode the database is shared with the CDC pipe — recreate
@@ -1008,6 +1015,13 @@ def main() -> int:
                 print(f"[setup] CDC probe failed: {e}", file=sys.stderr)
                 return 3
             print("[setup] CDC pipe verified.")
+            # CDC recreated the Exasol schema, so the earlier USE is stale.
+            if connector != "pyexasol":
+                try:
+                    runner.execute("__use_schema__", f"USE {args.schema}")
+                except Exception as e:
+                    print(f"[setup] {connector}: re-USE {args.schema} after CDC reset failed "
+                          f"({e}); table-fixture tests in this run will fail", file=sys.stderr)
 
     udf_dirs = sorted(d for d in args.tests_dir.iterdir()
                       if d.is_dir() and d.name not in ("__pycache__", "fixtures"))
