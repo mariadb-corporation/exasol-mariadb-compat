@@ -86,7 +86,7 @@ To run against your own deployment, point it at your hosts and credentials:
 | `--mariadb-host` `--mariadb-port` `--mariadb-user` `--mariadb-password` | MariaDB, for `--compare-*` (default `127.0.0.1:3306`, `admin_user`) |
 | `--connector` | one connector, a comma-separated list, or `all` |
 | `--udf` | run only this test group (repeatable) |
-| `--schema` | base name for the test schema (default `MARIADB_COMPAT_TEST`) |
+| `--schema` | base name for the test schema (default `mariadb_compat_test`) |
 | `--no-reload` | skip reinstalling the bundle first |
 
 Run `python tests/run_tests.py --help` for everything else, including
