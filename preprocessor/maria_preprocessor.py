@@ -4,8 +4,8 @@ import sqlglot
 from sqlglot import expressions as exp
 
 
-_PREPROCESSOR_VERSION = "2026.10.0"
-_PREPROCESSOR_BUILD = "3dbd442"
+_PREPROCESSOR_VERSION = "2026.10.0-2"
+_PREPROCESSOR_BUILD = "07c14d0-dirty"
 
 
 def adapter_call(request):

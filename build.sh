@@ -114,6 +114,12 @@ done
         echo ";"
         echo
     done
+
+    # impersonate=true runs queries as the connecting user, who needs EXECUTE
+    # on UTIL. Table access is unaffected (SELECT stays per-user).
+    echo "-- === UTIL execute grant ==="
+    echo "GRANT EXECUTE ON UTIL TO PUBLIC"
+    echo ";"
 } > "${OUT}"
 
 lines=$(wc -l < "${OUT}")
