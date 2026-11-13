@@ -196,7 +196,9 @@ def _rewrite_show_charset(tree):
     like = tree.args.get("like")
     if like is not None:
         sql += ' WHERE UPPER("Charset") LIKE UPPER(' + _sql_string(like.name) + ')'
-    return sql
+    # MariaDB lists charsets alphabetically; a bare VALUES list has no order
+    # and comes back in a different order on a multi-node cluster.
+    return sql + ' ORDER BY "Charset"'
 
 
 def _rewrite_show_create_table(tree):
