@@ -5,7 +5,7 @@ from sqlglot import expressions as exp
 
 
 _PREPROCESSOR_VERSION = "2026.10.0-2"
-_PREPROCESSOR_BUILD = "5f2d689"
+_PREPROCESSOR_BUILD = "fce395c"
 
 
 def adapter_call(request):

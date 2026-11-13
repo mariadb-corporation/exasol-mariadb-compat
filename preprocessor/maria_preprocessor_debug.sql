@@ -32,7 +32,7 @@ from sqlglot import expressions as exp
 # NB: production maria_preprocessor.sql keeps these same statements but with NO
 # comments — the documentation lives here in the debug variant only.
 _PREPROCESSOR_VERSION = "2026.10.0-2"
-_PREPROCESSOR_BUILD = "5f2d689"
+_PREPROCESSOR_BUILD = "fce395c"
 
 
 def adapter_call(request):
